@@ -39,18 +39,27 @@ func TestCaddyBinary(t *testing.T) {
 	defer cancel()
 	run := func(args ...string) []byte {
 		t.Helper()
-		out, err := exec.CommandContext(ctx, binary, args...).CombinedOutput()
+		cmd := exec.CommandContext(ctx, binary, args...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
 		if err != nil {
-			t.Fatalf("caddy %v: %v\n%s", args, err, out)
+			t.Fatalf("caddy %v: %v\n%s%s", args, err, out, stderr.Bytes())
 		}
 		return out
 	}
 	if out := run("list-modules"); !bytes.Contains(out, []byte("http.handlers.tap\n")) {
 		t.Fatal("Caddy binary does not contain http.handlers.tap")
 	}
+	readmeConfig := filepath.Join(dir, "readme.Caddyfile")
+	if err := os.WriteFile(readmeConfig, []byte(readmeExample(t, "caddyfile")), 0600); err != nil {
+		t.Fatal(err)
+	}
+	run("adapt", "--config", readmeConfig, "--adapter", "caddyfile")
 
 	requestPayload := []byte{0, 0xff, 'x', 'y', 'z'}
 	firstChunk, lastChunk := []byte{0, 0xfe}, []byte("stream-end")
+	rawHeader := string([]byte{0xff, 'x'})
 	release := make(chan struct{})
 	unblock := sync.OnceFunc(func() { close(release) })
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -90,12 +99,13 @@ func TestCaddyBinary(t *testing.T) {
 		}
 		payload, err := io.ReadAll(r.Body)
 		if err != nil || !bytes.Equal(payload, requestPayload) ||
-			r.Trailer.Get("X-Request-End") != "request-end" ||
+			r.Trailer.Get("X-Request-End") != "request-end" || r.Header.Get("X-Raw") != rawHeader ||
 			!reflect.DeepEqual(r.Header.Values("X-Multi"), []string{"one", "two"}) {
 			t.Errorf("upstream request body=%x trailer=%v header=%v error=%v", payload, r.Trailer, r.Header, err)
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
+		w.Header().Set("X-Raw", rawHeader)
 		w.Header().Add("Set-Cookie", "first=1")
 		w.Header().Add("Set-Cookie", "second=2")
 		w.Header().Set("Trailer", "X-Response-End")
@@ -117,6 +127,9 @@ func TestCaddyBinary(t *testing.T) {
 		cfg := fmt.Sprintf(`{
 	admin %s
 	persist_config off
+	servers {
+		protocols h1 h2c
+	}
 }
 http://%s {
 	@logged path /logged/*
@@ -178,7 +191,7 @@ http://%s {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	send := func(path string, onFirstChunk func()) {
+	send := func(client *http.Client, protocol string, path string, onFirstChunk func()) {
 		t.Helper()
 		req, err := http.NewRequestWithContext(ctx, "POST", baseURL+path, bytes.NewReader(requestPayload))
 		if err != nil {
@@ -187,6 +200,7 @@ http://%s {
 		req.ContentLength = -1
 		req.Trailer = http.Header{"X-Request-End": {"request-end"}}
 		req.Header["X-Multi"] = []string{"one", "two"}
+		req.Header.Set("X-Raw", rawHeader)
 		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -201,17 +215,25 @@ http://%s {
 		}
 		unblock()
 		rest, err := io.ReadAll(resp.Body)
-		if err != nil || resp.StatusCode != 201 || !bytes.Equal(rest, lastChunk) ||
+		if err != nil || resp.Proto != protocol || resp.StatusCode != 201 || !bytes.Equal(rest, lastChunk) ||
 			!reflect.DeepEqual(resp.Header.Values("Set-Cookie"), []string{"first=1", "second=2"}) ||
-			resp.Trailer.Get("X-Response-End") != "response-end" {
-			t.Fatalf("response status=%d body=%x header=%v trailer=%v error=%v", resp.StatusCode, rest, resp.Header, resp.Trailer, err)
+			resp.Trailer.Get("X-Response-End") != "response-end" || resp.Header.Get("X-Raw") != rawHeader {
+			t.Fatalf("response protocol=%s status=%d body=%x header=%v trailer=%v error=%v", resp.Proto, resp.StatusCode, rest, resp.Header, resp.Trailer, err)
 		}
 	}
-	send("/logged/drop?q=%2B", func() {
+	send(client, "HTTP/1.1", "/logged/drop?q=%2B", func() {
 		writeConfig("strict", "")
-		run("reload", "--config", config, "--adapter", "caddyfile", "--address", admin)
+		jsonConfig := filepath.Join(dir, "caddy.json")
+		if err := os.WriteFile(jsonConfig, run("adapt", "--config", config, "--adapter", "caddyfile"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		run("reload", "--config", jsonConfig, "--address", admin)
 	})
-	send("/logged/strict", nil)
+	var protocols http.Protocols
+	protocols.SetUnencryptedHTTP2(true)
+	h2Client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Protocols: &protocols}}
+	defer h2Client.CloseIdleConnections()
+	send(h2Client, "HTTP/2.0", "/logged/strict", nil)
 
 	upgradeCtx, cancelUpgrade := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelUpgrade()
@@ -240,6 +262,7 @@ http://%s {
 	if err := tunnel.Close(); err != nil {
 		t.Fatal(err)
 	}
+	h2Client.CloseIdleConnections()
 	run("stop", "--address", admin)
 	if err := cmd.Wait(); err != nil {
 		t.Fatal(err)
@@ -268,12 +291,16 @@ http://%s {
 		}
 		requestBody, responseBody := requestPayload, append(bytes.Clone(firstChunk), lastChunk...)
 		drop := e.Request.URL == "/logged/drop?q=%2B"
+		protocol := "HTTP/2.0"
 		if drop {
+			protocol = "HTTP/1.1"
 			requestBody, responseBody = requestBody[:3], responseBody[:3]
 		}
 		if (!drop && e.Request.URL != "/logged/strict") ||
-			e.Request.Method != "POST" || !e.Request.BodyComplete || e.Response.Status != 201 ||
+			e.Request.Method != "POST" || e.Request.Protocol != protocol || !e.Request.BodyComplete || e.Response.Status != 201 ||
 			e.Request.Truncated != drop || e.Response.Truncated != drop ||
+			!reflect.DeepEqual(e.Request.HeaderBase64["X-Raw"], [][]byte{[]byte(rawHeader)}) ||
+			!reflect.DeepEqual(e.Response.HeaderBase64["X-Raw"], [][]byte{[]byte(rawHeader)}) ||
 			e.Request.Trailer.Get("X-Request-End") != "request-end" ||
 			e.Response.Trailer.Get("X-Response-End") != "response-end" ||
 			!bytes.Equal(e.Request.Data, requestBody) || !bytes.Equal(e.Response.Data, responseBody) {

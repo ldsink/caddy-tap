@@ -152,3 +152,77 @@ func TestCaptureAbortPropagates(t *testing.T) {
 		panic(http.ErrAbortHandler)
 	}), 0, "test", func(record exchange) { e = record })
 }
+
+type closeErrorBody struct{ io.Reader }
+
+func (closeErrorBody) Close() error { return io.ErrClosedPipe }
+
+func TestCaptureCopyAndCloseErrors(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.Body = closeErrorBody{strings.NewReader("request")}
+	req.ContentLength = 7
+	e, err := recordExchange(t, httptest.NewRecorder(), req, 0, func(w http.ResponseWriter, r *http.Request) error {
+		if _, err := io.ReadFull(r.Body, make([]byte, 7)); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Body.Close(); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("close: %v", err)
+		}
+		if n, err := io.Copy(w, brokenBody{}); n != 1 || !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("copied %d bytes, error %v", n, err)
+		}
+		return nil
+	})
+	if err != nil || !e.Request.BodyComplete || e.Request.Error != io.ErrClosedPipe.Error() ||
+		e.Response.Error != io.ErrUnexpectedEOF.Error() || string(e.Response.Data) != "a" {
+		t.Fatalf("record %+v, error %v", e, err)
+	}
+}
+
+func TestCaptureImplicitResponseTrailer(t *testing.T) {
+	e, err := recordExchange(t, httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil), 0,
+		func(w http.ResponseWriter, _ *http.Request) error {
+			w.Header().Set(http.TrailerPrefix+"X-End", "done")
+			return nil
+		})
+	if err != nil || e.Response.Status != 0 || e.Response.Trailer.Get("X-End") != "done" || len(e.Response.Header) != 0 {
+		t.Fatalf("record %+v, error %v", e, err)
+	}
+}
+
+// Override promotion of FlushError by exposing only the basic writer.
+type basicWriter struct{ http.ResponseWriter }
+
+type flushFailureWriter struct{ http.ResponseWriter }
+
+func (flushFailureWriter) FlushError() error { return io.ErrClosedPipe }
+
+func TestCaptureResponseController(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	e, err := recordExchange(t, recorder, httptest.NewRequest(http.MethodGet, "/", nil), 0,
+		func(w http.ResponseWriter, _ *http.Request) error {
+			w.(http.Flusher).Flush()
+			if _, _, err := http.NewResponseController(w).Hijack(); !errors.Is(err, http.ErrNotSupported) {
+				t.Fatalf("unsupported hijack returned %v", err)
+			}
+			return nil
+		})
+	if err != nil || !recorder.Flushed || e.Response.Status != 200 || e.Response.Hijacked {
+		t.Fatalf("record %+v, error %v", e, err)
+	}
+	for _, tc := range []struct {
+		writer    http.ResponseWriter
+		err       error
+		status    int
+		bodyError string
+	}{
+		{basicWriter{httptest.NewRecorder()}, http.ErrNotSupported, 0, ""},
+		{flushFailureWriter{httptest.NewRecorder()}, io.ErrClosedPipe, 200, io.ErrClosedPipe.Error()},
+	} {
+		e, err := recordExchange(t, tc.writer, httptest.NewRequest(http.MethodGet, "/", nil), 0,
+			func(w http.ResponseWriter, _ *http.Request) error { return http.NewResponseController(w).Flush() })
+		if !errors.Is(err, tc.err) || e.Response.Status != tc.status || e.Response.Error != tc.bodyError {
+			t.Fatalf("record %+v, error %v", e, err)
+		}
+	}
+}

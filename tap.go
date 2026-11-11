@@ -20,24 +20,28 @@ import (
 
 var workers sync.Map
 
+const activeTapsVar = "http.handlers.tap.active"
+
 func init() {
-	caddy.OnExit(func(_ context.Context) {
-		workers.Range(func(key, _ any) bool {
-			rt := key.(*tapRuntime)
-			rt.mu.Lock()
-			rt.stopping = true
-			rt.closeQueue()
-			rt.mu.Unlock()
-			<-rt.done
-			return true
-		})
-	})
+	caddy.OnExit(drainWorkers)
 	caddy.RegisterModule(Tap{})
 	httpcaddyfile.RegisterHandlerDirective("tap", func(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 		tap := new(Tap)
 		return tap, tap.UnmarshalCaddyfile(h.Dispenser)
 	})
 	httpcaddyfile.RegisterDirectiveOrder("tap", httpcaddyfile.Before, "header")
+}
+
+func drainWorkers(_ context.Context) {
+	workers.Range(func(key, _ any) bool {
+		rt := key.(*tapRuntime)
+		rt.mu.Lock()
+		rt.stopping = true
+		rt.closeQueue()
+		rt.mu.Unlock()
+		<-rt.done
+		return true
+	})
 }
 
 // Tap records HTTP exchanges at its position in the handler chain.
@@ -56,15 +60,16 @@ type Tap struct {
 }
 
 type tapRuntime struct {
-	mu       sync.Mutex
-	stopping bool
-	active   int
-	closed   bool
-	slots    chan struct{}
-	queue    chan queuedRecord
-	done     chan struct{}
-	dropped  atomic.Uint64
-	logger   *zap.Logger
+	mu         sync.Mutex
+	stopping   bool
+	active     int
+	closed     bool
+	slots      chan struct{}
+	queue      chan queuedRecord
+	done       chan struct{}
+	dropped    atomic.Uint64
+	dropNotice chan struct{}
+	logger     *zap.Logger
 }
 
 type queuedRecord struct {
@@ -133,10 +138,11 @@ func (t *Tap) Provision(ctx caddy.Context) error {
 	}
 	logger := ctx.Logger().With(zap.String("identity", t.Identity))
 	t.runtime = &tapRuntime{
-		slots:  make(chan struct{}, t.QueueSize),
-		queue:  make(chan queuedRecord, t.QueueSize),
-		done:   make(chan struct{}),
-		logger: logger,
+		slots:      make(chan struct{}, t.QueueSize),
+		queue:      make(chan queuedRecord, t.QueueSize),
+		done:       make(chan struct{}),
+		dropNotice: make(chan struct{}, 1),
+		logger:     logger,
 	}
 	sink := fileSink{
 		dir: dir, prefix: "tap-" + t.Identity + "--",
@@ -154,18 +160,29 @@ func (rt *tapRuntime) writeRecords(sink *fileSink) {
 	defer close(rt.done)
 	defer sink.reportClose()
 	var reportedDrops uint64
-	for item := range rt.queue {
-		err := sink.write(time.Now(), item.record)
-		if err != nil {
-			rt.logger.Error("could not write HTTP exchange", zap.Error(err))
-		}
-		<-rt.slots
+	reportDrops := func() {
 		if dropped := rt.dropped.Load(); dropped > reportedDrops {
 			rt.logger.Warn("tap capacity exhausted, HTTP exchanges dropped", zap.Uint64("dropped_total", dropped), zap.Uint64("dropped_since_last_warning", dropped-reportedDrops))
 			reportedDrops = dropped
 		}
-		if item.result != nil {
-			item.result <- err
+	}
+	defer reportDrops()
+	for {
+		select {
+		case <-rt.dropNotice:
+			reportDrops()
+		case item, ok := <-rt.queue:
+			if !ok {
+				return
+			}
+			err := sink.write(time.Now(), item.record)
+			if err != nil {
+				rt.logger.Error("could not write HTTP exchange", zap.Error(err))
+			}
+			<-rt.slots
+			if item.result != nil {
+				item.result <- err
+			}
 		}
 	}
 }
@@ -199,6 +216,11 @@ func (rt *tapRuntime) closeQueue() {
 
 func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	rt := t.runtime
+	vars, _ := r.Context().Value(caddyhttp.VarsCtxKey).(map[string]any)
+	activeTaps, _ := vars[activeTapsVar].(map[*tapRuntime]bool)
+	if activeTaps[rt] {
+		return next.ServeHTTP(w, r)
+	}
 	strict := t.Mode == "strict"
 	rt.mu.Lock()
 	if rt.stopping {
@@ -209,7 +231,12 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 		select {
 		case rt.slots <- struct{}{}:
 		default:
-			rt.dropped.Add(1)
+			if dropped := rt.dropped.Add(1); dropped&(dropped-1) == 0 {
+				select {
+				case rt.dropNotice <- struct{}{}:
+				default:
+				}
+			}
 			rt.mu.Unlock()
 			return next.ServeHTTP(w, r)
 		}
@@ -217,9 +244,6 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 	rt.active++
 	rt.mu.Unlock()
 
-	if strict {
-		rt.slots <- struct{}{}
-	}
 	defer func() {
 		rt.mu.Lock()
 		rt.active--
@@ -231,7 +255,26 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 
 	item := queuedRecord{}
 	if strict {
+		ctx := r.Context()
+		select {
+		case rt.slots <- struct{}{}:
+			if err := ctx.Err(); err != nil {
+				<-rt.slots
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		item.result = make(chan error, 1)
+	}
+	// A named route can invoke the same Tap again before its first invocation returns.
+	if vars != nil {
+		if activeTaps == nil {
+			activeTaps = make(map[*tapRuntime]bool)
+			vars[activeTapsVar] = activeTaps
+		}
+		activeTaps[rt] = true
+		defer delete(activeTaps, rt)
 	}
 	var persistErr error
 	handlerErr := capture(w, r, next, t.MaxBodyBytes, t.Identity, func(record exchange) {

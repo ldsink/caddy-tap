@@ -2,8 +2,10 @@ package tap
 
 import (
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -103,5 +105,100 @@ func TestRetentionByAgeAlone(t *testing.T) {
 	paths, err := filepath.Glob(filepath.Join(s.dir, "*.ndjson"))
 	if err != nil || len(paths) != 2 {
 		t.Fatalf("paths %v, error %v", paths, err)
+	}
+}
+
+func TestRetentionWaitsForFirstSuccessfulRecord(t *testing.T) {
+	dir := t.TempDir()
+	s := fileSink{dir: dir, prefix: "tap-api--", sizeLimit: 1 << 20, keep: 1, maxAge: time.Hour, strict: true, logger: zap.NewNop()}
+	t.Cleanup(s.reportClose)
+	now := time.Now()
+	expired := filepath.Join(dir, s.prefix+now.Add(-2*time.Hour).UTC().Format(fileTimeFormat)+"-123.ndjson")
+	if err := os.WriteFile(expired, []byte("{}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.open(now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(expired); err != nil {
+		t.Fatalf("old record disappeared before a replacement was written: %v", err)
+	}
+	path := s.file.Name()
+	if err := s.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readOnly, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.file = readOnly
+	if err := s.write(now, exchange{Timestamp: now}); err == nil || s.file != nil {
+		t.Fatalf("failed write left open file %v, error %v", s.file, err)
+	}
+	if _, err := os.Stat(expired); err != nil {
+		t.Fatalf("old record disappeared after a failed write: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("failed first write left an empty file: %v", err)
+	}
+	if err := s.write(now, exchange{Timestamp: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(expired); !os.IsNotExist(err) {
+		t.Fatalf("old record still present after a successful write: %v", err)
+	}
+}
+
+func TestFilePreservesNonUTF8Metadata(t *testing.T) {
+	dir := t.TempDir()
+	s := fileSink{dir: dir, prefix: "tap-api--", sizeLimit: 1 << 20, keep: -1, maxAge: -1, logger: zap.NewNop()}
+	t.Cleanup(s.reportClose)
+	raw := string([]byte{0xff, 'x'})
+	header := http.Header{"X-Raw": {"plain", raw}, "X-Text": {"中文"}}
+	record := exchange{
+		Timestamp: time.Now(),
+		Request:   requestRecord{URL: "/?q=" + raw, RequestURI: "/?q=" + raw, Header: header, Trailer: header},
+		Response: responseRecord{
+			responseHead:  responseHead{Status: 200, Header: header},
+			Trailer:       header,
+			Informational: []responseHead{{Status: 103, Header: header}},
+		},
+	}
+	if err := s.write(record.Timestamp, record); err != nil {
+		t.Fatal(err)
+	}
+	records, err := readExchanges(dir)
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records %+v, error %v", records, err)
+	}
+	e := records[0]
+	if string(e.Request.URLBase64) != record.Request.URL || string(e.Request.RequestURIBase64) != record.Request.RequestURI ||
+		e.Request.Header.Get("X-Text") != "中文" || len(e.Response.Informational) != 1 {
+		t.Fatalf("record %+v", e)
+	}
+	want := map[string][][]byte{"X-Raw": {[]byte("plain"), []byte(raw)}}
+	for _, original := range []map[string][][]byte{
+		e.Request.HeaderBase64, e.Request.TrailerBase64, e.Response.HeaderBase64,
+		e.Response.TrailerBase64, e.Response.Informational[0].HeaderBase64,
+	} {
+		if !reflect.DeepEqual(original, want) {
+			t.Fatalf("original header bytes %v, want %v", original, want)
+		}
+	}
+	if record.Response.Informational[0].HeaderBase64 != nil {
+		t.Fatal("encoding mutated the caller's informational response")
+	}
+}
+
+func TestInvalidRecordDoesNotCreateFile(t *testing.T) {
+	dir := t.TempDir()
+	s := fileSink{dir: dir, prefix: "tap-api--", sizeLimit: 1 << 20, keep: -1, maxAge: -1, logger: zap.NewNop()}
+	invalidTime := time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	if err := s.write(time.Now(), exchange{Timestamp: invalidTime}); err == nil {
+		t.Fatal("encoded a timestamp outside JSON's supported range")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("invalid record created a file: entries %v, error %v", entries, err)
 	}
 }

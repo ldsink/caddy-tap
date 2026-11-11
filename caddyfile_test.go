@@ -2,6 +2,7 @@ package tap
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -84,6 +85,8 @@ func TestInvalidCaddyfile(t *testing.T) {
 		{"mode", "wrong argument"},
 		{"mode drop {\nqueue_size 1\n}", "nested"},
 		{"roll_size 0", "positive"},
+		{"roll_size 9EiB", "fit in int64"},
+		{"roll_size nope", "roll_size"},
 		{"max_body_bytes 4MiB extra", "wrong argument"},
 		{"roll_interval -2h", "nonnegative"},
 		{"roll_keep -2", "retention"},
@@ -103,5 +106,37 @@ func TestInvalidCaddyfile(t *testing.T) {
 		if err := cfg.Validate(); err == nil {
 			t.Fatalf("accepted invalid JSON config %+v", cfg)
 		}
+	}
+}
+
+func readmeExample(t *testing.T, language string) string {
+	t.Helper()
+	content, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rest, ok := strings.Cut(string(content), "```"+language+"\n")
+	if !ok {
+		t.Fatalf("README has no %s example", language)
+	}
+	example, _, ok := strings.Cut(rest, "\n```")
+	if !ok {
+		t.Fatalf("README %s example has no closing fence", language)
+	}
+	return example
+}
+
+func TestReadmeJSONExample(t *testing.T) {
+	var cfg struct {
+		Handler string `json:"handler"`
+		Tap
+	}
+	d := json.NewDecoder(strings.NewReader(readmeExample(t, "json")))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&cfg); err != nil {
+		t.Fatalf("README JSON: %v", err)
+	}
+	if err := cfg.Tap.Validate(); err != nil || cfg.Handler != "tap" {
+		t.Fatalf("README handler %q, config error %v", cfg.Handler, err)
 	}
 }

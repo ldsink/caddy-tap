@@ -54,11 +54,11 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
 | `roll_keep` | `10` | 同一目录、同一标识最多保留的已关闭文件数。设为 `-1` 关闭该限制。 |
 | `roll_keep_for` | `2160h` | 以文件名中的 UTC 时间判断已关闭文件的最大保留时长。设为 `-1` 关闭该限制。 |
 
-大小参数支持字节数和 `KiB`、`MiB` 等单位。保留策略在新文件打开时执行，同时应用已启用的限制。空闲期间不会定时删除文件。多个 Caddy 进程使用独立的输出目录或标识，以便各自管理保留策略。
+大小参数支持字节数和 `KiB`、`MiB` 等单位。保留策略在新文件的首条记录成功写入后执行，同时应用已启用的限制。空闲期间不会定时删除文件。多个 Caddy 进程使用独立的输出目录或标识，以便各自管理保留策略。
 
 ## JSON 配置
 
-将该对象放入 HTTP 路由的 `handle` 数组，置于需要观察的 handler 前。路径匹配器属于该路由的 `match` 字段。JSON 大小参数为字节整数，时长可用字符串或纳秒整数。
+将该对象放入 HTTP 路由的 `handle` 数组，置于需要观察的 handler 前。路径匹配器属于该路由的 `match` 字段。JSON 大小参数为字节整数，时长可用字符串或纳秒整数。JSON 中使用数字 `-1` 关闭 `roll_keep_for`，在 Caddyfile 中使用 `roll_keep_for -1`。
 
 ```json
 {
@@ -78,23 +78,26 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
 
 - 文件名形如 `tap-api--20261111T120000.000000000Z-123456789.ndjson`，包含标识、UTC 时间和避免冲突的数字后缀。新建文件权限为 `0600`。
 - 每行包含 `identity`、`timestamp`、`duration_ns`、`request` 和 `response`。请求字段包含 `method`、`url`、`request_uri`、`host`、`scheme`、`protocol`、`remote_addr`、`content_length` 和可用的 `transfer_encoding`。相对形式的 URL 可结合 `scheme` 和 `host` 使用。请求和响应的 `header`、`trailer` 以字符串数组保留重复值。响应另有 `status` 和可用的 `informational`、`hijacked`。
+- 当 header 或 trailer 的某个值包含非 UTF-8 字节时，`header_base64` 或 `trailer_base64` 保存对应名称下的全部原始值，顺序和文本字段一致。对于非 UTF-8 的 URL 或请求目标，使用 `url_base64` 或 `request_uri_base64` 还原原始字节。
 - `body_base64` 可还原捕获到的字节，无字节时为 `null`。`body_bytes` 是中间件观察到的总字节数，`body_truncated` 表示达到采集上限。请求的 `body_complete` 表示观察到 EOF 或已读取完整的已知长度。I/O 错误记为 `body_error`，下游返回的错误记为 `error`，下游 panic 时记录 `aborted: true` 并让 Caddy 继续处理。
 - 捕获发生在 Caddy handler 边界。请求体只复制下游实际读取的字节。响应体复制写入器接受的字节，服务器后来补充的 header、链路外生成的响应和连接升级后直接写入连接的数据超出捕获范围。 `status: 0` 表示未观察到最终状态的提交，可能包括空 handler、Caddy 外层错误处理或直接写入升级握手的场景。
-- 默认模式在后台汇总容量丢弃计数及写入错误，热重载时，旧配置继续记录它已经开始采集的交换。优雅关闭会排空已进入写入队列的记录。超出 Caddy 关闭宽限期的在途请求，以及强制终止时未落盘的记录，可能丢失。
-- 严格模式将采集数据保留在内存中，并在 handler 返回前等待文件同步。已经流式写给客户端的响应可能先到达。磁盘写入失败会记录到 Caddy 日志，尚未提交响应且下游没有返回错误时会返回 HTTP 500。大 body 会增加内存占用，慢磁盘会提高请求延迟。
+- 默认模式在后台汇总容量丢弃计数并报告写入错误。热重载时，旧配置继续记录它已经开始采集的交换。优雅关闭会排空已进入写入队列的记录。超出 Caddy 关闭宽限期的在途请求，以及强制终止时未落盘的记录，可能丢失。
+- 严格模式将采集数据保留在内存中，并在 handler 返回前等待文件同步。请求在等待采集容量时取消，会结束等待。已经进入写入队列的记录会继续写入。已经流式写给客户端的响应可能先到达。磁盘写入失败会记录到 Caddy 日志，尚未提交响应且下游没有返回错误时会返回 HTTP 500。大 body 会增加内存占用，慢磁盘会提高请求延迟。
+
+同一请求在同一个命名路由中重复进入同一 tap 实例时，由外层调用记录一次。
 
 日志按原样保存凭证、Cookie、查询参数和 body。使用仅供 Caddy 和获授权读取方访问的目录。
 
 ## 测试
 
 ```sh
-go test ./...
+go test -cover ./...
 go test -race ./...
 go vet ./...
 CADDY_TAP_BIN=/tmp/caddy-tap go test -run '^TestCaddyBinary$' -v
 ```
 
-二进制集成测试启动真实 Caddy 和本地 HTTP 上游，检查匹配范围、反向代理、流式响应、请求和响应 trailer、响应期间热重载、HTTP/1.1 连接升级、文件轮转和日志落盘。
+二进制集成测试在临时配置和数据目录中启动真实 Caddy 和本地 HTTP 上游，检查路径匹配、HTTP/1.1 和 HTTP/2（h2c）代理、流式响应、双向 trailer、非 UTF-8 header、从 Caddyfile 热重载到 JSON、HTTP/1.1 连接升级、文件轮转和日志落盘。
 
 ## 许可证
 
