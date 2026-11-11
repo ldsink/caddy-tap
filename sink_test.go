@@ -202,3 +202,26 @@ func TestInvalidRecordDoesNotCreateFile(t *testing.T) {
 		t.Fatalf("invalid record created a file: entries %v, error %v", entries, err)
 	}
 }
+
+func TestStrictFirstSyncFailureDiscardsNewFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "unsyncable")
+	if err := os.Symlink(os.DevNull, path); err != nil {
+		t.Skipf("cannot create sync failure fixture: %v", err)
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	if err := file.Sync(); err == nil {
+		t.Skip("null device supports sync")
+	}
+	s := fileSink{file: file, strict: true, logger: zap.NewNop()}
+	if err := s.write(time.Now(), exchange{}); err == nil {
+		t.Fatal("first record succeeded despite sync failure")
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("failed file remains eligible for retention: %v", err)
+	}
+}

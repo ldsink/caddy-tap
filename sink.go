@@ -60,13 +60,13 @@ func (s *fileSink) write(now time.Time, record exchange) error {
 		s.reportClose()
 		return errors.Join(err, rollback)
 	}
-	s.written += int64(n)
 	if s.strict {
 		if err := s.file.Sync(); err != nil {
 			s.reportClose()
 			return err
 		}
 	}
+	s.written += int64(n)
 	if firstRecord {
 		activeFiles.Lock()
 		err := s.prune(now)
