@@ -88,16 +88,23 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
 
 日志按原样保存凭证、Cookie、查询参数和 body。使用仅供 Caddy 和获授权读取方访问的目录。
 
+### Server-Sent Events（SSE）
+
+对 `Content-Type: text/event-stream` 的响应，tap 将事件照常转发并透传 flush。日志在 handler 返回时生成，每个采集到的 SSE 请求对应一条记录。解码 `response.body_base64` 可还原捕获的 SSE 字节，包括心跳注释、换行、事件分隔符和多行数据。客户端断开后，如果 handler 随之返回，日志保留此前写入器接受的字节。
+
+默认模式下，长流超过 `max_body_bytes` 时只截断日志，客户端仍可继续接收事件。严格模式保留全部可观察字节，并在流结束前将它们保存在内存中。持续开放的连接会占用采集槽位，期间不会生成逐事件日志。
+
 ## 测试
 
 ```sh
 go test -cover ./...
+go test -run '^TestSSECapture$' -v
 go test -race ./...
 go vet ./...
 CADDY_TAP_BIN=/tmp/caddy-tap go test -run '^TestCaddyBinary$' -v
 ```
 
-二进制集成测试在临时配置和数据目录中启动真实 Caddy 和本地 HTTP 上游，检查路径匹配、HTTP/1.1 和 HTTP/2（h2c）代理、流式响应、双向 trailer、非 UTF-8 header、从 Caddyfile 热重载到 JSON、HTTP/1.1 连接升级、文件轮转和日志落盘。
+二进制集成测试在临时配置和数据目录中启动真实 Caddy 和本地 HTTP 上游，检查路径匹配、HTTP/1.1 和 HTTP/2（h2c）代理、SSE 流式响应、双向 trailer、非 UTF-8 header、从 Caddyfile 热重载到 JSON、HTTP/1.1 连接升级、文件轮转和日志落盘。
 
 ## 许可证
 

@@ -58,7 +58,7 @@ func TestCaddyBinary(t *testing.T) {
 	run("adapt", "--config", readmeConfig, "--adapter", "caddyfile")
 
 	requestPayload := []byte{0, 0xff, 'x', 'y', 'z'}
-	firstChunk, lastChunk := []byte{0, 0xfe}, []byte("stream-end")
+	firstChunk, lastChunk := []byte(": heartbeat\n\nid: 1\ndata: 你好\n\n"), []byte("id: 2\nevent: update\ndata: stream-end\n\n")
 	rawHeader := string([]byte{0xff, 'x'})
 	release := make(chan struct{})
 	unblock := sync.OnceFunc(func() { close(release) })
@@ -105,11 +105,12 @@ func TestCaddyBinary(t *testing.T) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
+		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("X-Raw", rawHeader)
 		w.Header().Add("Set-Cookie", "first=1")
 		w.Header().Add("Set-Cookie", "second=2")
 		w.Header().Set("Trailer", "X-Response-End")
-		w.WriteHeader(http.StatusCreated)
+		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(firstChunk)
 		w.(http.Flusher).Flush()
 		<-release
@@ -140,9 +141,7 @@ http://%s {
 		%s
 		roll_size 1KiB
 	}
-	reverse_proxy %s {
-		flush_interval -1
-	}
+	reverse_proxy %s
 }
 `, admin, addr, logs, mode, limit, upstream.URL)
 		if err := os.WriteFile(config, []byte(cfg), 0600); err != nil {
@@ -215,9 +214,10 @@ http://%s {
 		}
 		unblock()
 		rest, err := io.ReadAll(resp.Body)
-		if err != nil || resp.Proto != protocol || resp.StatusCode != 201 || !bytes.Equal(rest, lastChunk) ||
+		if err != nil || resp.Proto != protocol || resp.StatusCode != http.StatusOK || !bytes.Equal(rest, lastChunk) ||
 			!reflect.DeepEqual(resp.Header.Values("Set-Cookie"), []string{"first=1", "second=2"}) ||
-			resp.Trailer.Get("X-Response-End") != "response-end" || resp.Header.Get("X-Raw") != rawHeader {
+			resp.Trailer.Get("X-Response-End") != "response-end" || resp.Header.Get("X-Raw") != rawHeader ||
+			resp.Header.Get("Content-Type") != "text/event-stream" {
 			t.Fatalf("response protocol=%s status=%d body=%x header=%v trailer=%v error=%v", resp.Proto, resp.StatusCode, rest, resp.Header, resp.Trailer, err)
 		}
 	}
@@ -297,8 +297,9 @@ http://%s {
 			requestBody, responseBody = requestBody[:3], responseBody[:3]
 		}
 		if (!drop && e.Request.URL != "/logged/strict") ||
-			e.Request.Method != "POST" || e.Request.Protocol != protocol || !e.Request.BodyComplete || e.Response.Status != 201 ||
+			e.Request.Method != "POST" || e.Request.Protocol != protocol || !e.Request.BodyComplete || e.Response.Status != http.StatusOK ||
 			e.Request.Truncated != drop || e.Response.Truncated != drop ||
+			e.Response.Header.Get("Content-Type") != "text/event-stream" ||
 			!reflect.DeepEqual(e.Request.HeaderBase64["X-Raw"], [][]byte{[]byte(rawHeader)}) ||
 			!reflect.DeepEqual(e.Response.HeaderBase64["X-Raw"], [][]byte{[]byte(rawHeader)}) ||
 			e.Request.Trailer.Get("X-Request-End") != "request-end" ||
