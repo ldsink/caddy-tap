@@ -251,18 +251,18 @@ func snapshotResponseHeader(header http.Header) http.Header {
 
 func responseTrailers(committed, final http.Header) http.Header {
 	trailers := make(http.Header)
-	for _, declared := range committed.Values("Trailer") {
-		for name := range strings.SplitSeq(declared, ",") {
-			key := http.CanonicalHeaderKey(strings.TrimSpace(name))
-			if values := final.Values(key); len(values) != 0 {
-				trailers[key] = append([]string(nil), values...)
-			}
-		}
-	}
 	for name, values := range final {
 		if key, ok := strings.CutPrefix(name, http.TrailerPrefix); ok {
 			key = http.CanonicalHeaderKey(key)
 			trailers[key] = append(trailers[key], values...)
+		}
+	}
+	for _, declared := range committed.Values("Trailer") {
+		for name := range strings.SplitSeq(declared, ",") {
+			key := http.CanonicalHeaderKey(strings.TrimSpace(name))
+			if values := final.Values(key); len(values) != 0 {
+				trailers[key] = append(trailers[key], values...)
+			}
 		}
 	}
 	return trailers

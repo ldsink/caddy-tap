@@ -226,3 +226,30 @@ func TestCaptureResponseController(t *testing.T) {
 		}
 	}
 }
+
+func TestResponseTrailerOrderMatchesHTTP1(t *testing.T) {
+	records := make(chan exchange, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = capture(w, r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+			w.Header().Set("Trailer", "X-End, X-End")
+			_, err := io.WriteString(w, "body")
+			w.Header().Set(http.TrailerPrefix+"X-End", "prefixed")
+			w.Header().Set("X-End", "declared")
+			return err
+		}), 0, "test", func(e exchange) { records <- e })
+	}))
+	defer server.Close()
+	resp, err := server.Client().Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"prefixed", "declared", "declared"}
+	got := (<-records).Response.Trailer.Values("X-End")
+	if !reflect.DeepEqual(resp.Trailer.Values("X-End"), want) || !reflect.DeepEqual(got, want) {
+		t.Fatalf("HTTP trailers %v, logged trailers %v, want %v", resp.Trailer, got, want)
+	}
+}
