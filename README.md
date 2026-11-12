@@ -99,14 +99,10 @@ In default mode, a stream that exceeds `max_body_bytes` is truncated in the log 
 ## Tests
 
 ```sh
-go test -cover ./...
-go test -run '^TestSSECapture$' -v
-go test -race ./...
-go vet ./...
-CADDY_TAP_BIN=/tmp/caddy-tap go test -run '^TestCaddyBinary$' -v
+make test
 ```
 
-The binary integration test starts a real Caddy process and a local HTTP upstream, using temporary configuration and data directories. It checks path matching, HTTP/1.1 and HTTP/2 (h2c) proxying, SSE streaming, trailers in both directions, non-UTF-8 headers, hot reload from Caddyfile to JSON, HTTP/1.1 connection upgrades, log rotation, and persistence.
+This runs the test suite with coverage and race detection, followed by `go vet`. To include the Caddy binary integration test, run `CADDY_TAP_BIN=/tmp/caddy-tap make test` after building the binary above.
 
 ## License
 

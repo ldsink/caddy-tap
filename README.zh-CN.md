@@ -99,14 +99,10 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
 ## 测试
 
 ```sh
-go test -cover ./...
-go test -run '^TestSSECapture$' -v
-go test -race ./...
-go vet ./...
-CADDY_TAP_BIN=/tmp/caddy-tap go test -run '^TestCaddyBinary$' -v
+make test
 ```
 
-二进制集成测试在临时配置和数据目录中启动真实 Caddy 和本地 HTTP 上游，检查路径匹配、HTTP/1.1 和 HTTP/2（h2c）代理、SSE 流式响应、双向 trailer、非 UTF-8 header、从 Caddyfile 热重载到 JSON、HTTP/1.1 连接升级、文件轮转和日志落盘。
+该命令运行测试并开启覆盖率统计和竞态检测，随后执行 `go vet`。要同时运行 Caddy 二进制集成测试，请按上文构建二进制文件后执行 `CADDY_TAP_BIN=/tmp/caddy-tap make test`。
 
 ## 许可证
 
