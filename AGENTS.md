@@ -2,6 +2,8 @@
 
 `caddy-tap` is HTTP capture middleware for Caddy v2 and uses Go 1.26.
 
+Prefer English for commit messages and code comments.
+
 ## Documentation
 
 - `README.md` is the default English README, and `README.zh-CN.md` is the Simplified Chinese version. When updating either version, update the other in the same change. Keep feature descriptions, configuration options, defaults, examples, and limitations consistent. Preserve the language switch links at the top of both files.
