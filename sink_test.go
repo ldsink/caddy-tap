@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -63,7 +64,7 @@ func TestRotationBySizeAndTime(t *testing.T) {
 			}
 			for _, path := range paths {
 				st, err := os.Stat(path)
-				if err != nil || st.Mode().Perm()&0077 != 0 || !namePattern.MatchString(st.Name()) {
+				if err != nil || (runtime.GOOS != "windows" && st.Mode().Perm()&0077 != 0) || !namePattern.MatchString(st.Name()) {
 					t.Fatalf("stat %v, error %v", st, err)
 				}
 			}
@@ -321,5 +322,64 @@ func TestFinalizationDoesNotOverwriteExistingLog(t *testing.T) {
 	}
 	if data, err := os.ReadFile(part); err != nil || !json.Valid(data) {
 		t.Fatalf("part contains %q, error %v", data, err)
+	}
+}
+
+func TestRetentionKeepsLatestWriteWithinSameSecond(t *testing.T) {
+	s := fileSink{dir: t.TempDir(), prefix: "api-", keep: 1, maxAge: -1}
+	now := time.Now().UTC().Truncate(time.Second)
+	stem := s.prefix + now.Format(fileTimeFormat)
+	older := filepath.Join(s.dir, stem+"-999.ndjson")
+	newer := filepath.Join(s.dir, stem+"-111.ndjson")
+	for i, path := range []string{older, newer} {
+		if err := os.WriteFile(path, []byte("{}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		stamp := now.Add(time.Duration(i) * 500 * time.Millisecond)
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.prune(now); err != nil {
+		t.Fatal(err)
+	}
+	if got := oneLogFile(t, s.dir, "*.ndjson"); got != newer {
+		t.Fatalf("retained %q, want %q", got, newer)
+	}
+}
+
+func TestRecoveryRejectsNonUTF8Record(t *testing.T) {
+	part := filepath.Join(t.TempDir(), "api.ndjson.part")
+	original := []byte("{}\n{\"value\":\"\xff\"}\n{")
+	if err := os.WriteFile(part, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	file, _, err := recoverPart(part)
+	if file != nil {
+		_ = file.Close()
+	}
+	if err == nil {
+		t.Fatal("recovery accepted a record with invalid UTF-8")
+	}
+	got, err := os.ReadFile(part)
+	if err != nil || string(got) != string(original) {
+		t.Fatalf("damaged part contains %q, error %v", got, err)
+	}
+}
+
+func TestStrictWriteSyncsAndSealsFile(t *testing.T) {
+	s := fileSink{dir: t.TempDir(), prefix: "api-", sizeLimit: 1 << 20, strict: true, keep: -1, maxAge: -1, logger: zap.NewNop()}
+	now := time.Now()
+	t.Cleanup(func() { s.reportClose(now) })
+	if err := s.write(now, exchange{Identity: "api"}); err != nil {
+		t.Fatal(err)
+	}
+	if s.syncedDir != (runtime.GOOS != "windows") {
+		t.Fatalf("directory sync state was %t on %s", s.syncedDir, runtime.GOOS)
+	}
+	s.reportClose(now)
+	records, err := readExchanges(s.dir)
+	if err != nil || len(records) != 1 || records[0].Identity != "api" {
+		t.Fatalf("strict records %+v, error %v", records, err)
 	}
 }

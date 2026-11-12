@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -286,7 +287,7 @@ func TestProvisionDefaultsAndInvalidDirectory(t *testing.T) {
 		t.Fatalf("defaults %+v", tap)
 	}
 	info, err := os.Stat(dir)
-	if err != nil || info.Mode().Perm()&0077 != 0 {
+	if err != nil || (runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0) {
 		t.Fatalf("log directory stat %v, error %v", info, err)
 	}
 	file := filepath.Join(root, "file")

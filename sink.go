@@ -3,6 +3,7 @@ package tap
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -59,7 +61,8 @@ func (s *fileSink) write(now time.Time, record exchange) error {
 	n, err := s.file.Write(data)
 	if err == nil && s.strict {
 		err = s.file.Sync()
-		if err == nil && !s.syncedDir {
+		// Windows cannot flush the read-only directory handle used by syncDir.
+		if err == nil && !s.syncedDir && runtime.GOOS != "windows" {
 			err = s.syncDir()
 			s.syncedDir = err == nil
 		}
@@ -266,7 +269,7 @@ func recoverPart(path string) (*os.File, int64, error) {
 			return nil, 0, errors.Join(err, file.Close())
 		}
 		record := bytes.TrimSpace(line)
-		if len(record) == 0 || record[0] != '{' || !json.Valid(record) {
+		if len(record) == 0 || record[0] != '{' || !utf8.Valid(record) || !json.Valid(record) {
 			return nil, 0, errors.Join(fmt.Errorf("invalid NDJSON record at offset %d", size), file.Close())
 		}
 		size += int64(len(line))
@@ -299,21 +302,50 @@ func (s *fileSink) prune(now time.Time) error {
 	if err != nil {
 		return err
 	}
-	kept := 0
+	type logFile struct {
+		name            string
+		stamp, modified time.Time
+	}
+	var files []logFile
 	var removeErr error
-	for i := len(entries) - 1; i >= 0; i-- {
-		entry := entries[i]
+	remove := func(name string) {
+		if err := os.Remove(filepath.Join(s.dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			removeErr = errors.Join(removeErr, err)
+		}
+	}
+	for _, entry := range entries {
 		stamp, ok := s.fileStamp(entry, logSuffix)
 		if !ok {
 			continue
 		}
-		if (s.maxAge > 0 && now.Truncate(time.Second).Sub(stamp) > s.maxAge) || (s.keep >= 0 && kept >= s.keep) {
-			path := filepath.Join(s.dir, entry.Name())
-			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				removeErr = errors.Join(removeErr, err)
-			}
-		} else {
-			kept++
+		if s.maxAge > 0 && now.Truncate(time.Second).Sub(stamp) > s.maxAge {
+			remove(entry.Name())
+			continue
+		}
+		if s.keep < 0 {
+			continue
+		}
+		info, err := entry.Info()
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return errors.Join(removeErr, err)
+		}
+		files = append(files, logFile{entry.Name(), stamp, info.ModTime()})
+	}
+	slices.SortFunc(files, func(a, b logFile) int {
+		if order := b.stamp.Compare(a.stamp); order != 0 {
+			return order
+		}
+		if order := b.modified.Compare(a.modified); order != 0 {
+			return order
+		}
+		return cmp.Compare(b.name, a.name)
+	})
+	if s.keep >= 0 && len(files) > s.keep {
+		for _, file := range files[s.keep:] {
+			remove(file.name)
 		}
 	}
 	return removeErr
