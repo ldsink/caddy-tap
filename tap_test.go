@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -476,6 +477,48 @@ func TestSharedWriterRejectsConflictingSettings(t *testing.T) {
 	}
 }
 
+func TestProvisionWaitsForClosingWriter(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	synctest.Test(t, func(t *testing.T) {
+		// Keep the old writer registered while it finishes closing its files.
+		lockPath := filepath.Join(dir, ".tap-api.lock")
+		old := &tapRuntime{closed: true, done: make(chan struct{})}
+		writerGroups.Lock()
+		writerGroups.byPath[lockPath] = old
+		writerGroups.Unlock()
+
+		tap := &Tap{Identity: "api", Directory: dir}
+		ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+		defer cancel()
+		result := make(chan error, 1)
+		go func() { result <- tap.Provision(ctx) }()
+		synctest.Wait()
+		returnedEarly := len(result) != 0
+
+		writerGroups.Lock()
+		if writerGroups.byPath[lockPath] == old {
+			delete(writerGroups.byPath, lockPath)
+		}
+		writerGroups.Unlock()
+		close(old.done)
+
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := tap.Cleanup(); err != nil {
+				t.Error(err)
+			}
+		})
+		if returnedEarly || tap.runtime == old {
+			t.Fatal("provision returned before the old writer finished")
+		}
+	})
+}
+
 func TestIdleRotationPublishesPart(t *testing.T) {
 	dir := t.TempDir()
 	tap := &Tap{Identity: "api", Directory: dir, Mode: "strict", RollInterval: caddy.Duration(50 * time.Millisecond)}
@@ -558,6 +601,19 @@ func TestNestedStrictCaptureReturns503WhenFull(t *testing.T) {
 	if len(outer.runtime.slots) != 0 || len(inner.runtime.slots) != 0 {
 		t.Fatal("rejected nested capture leaked a slot")
 	}
+	inner.runtime.slots <- struct{}{}
+	canceled := httptest.NewRecorder()
+	err = outer.ServeHTTP(canceled, request, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		ctx, cancel := context.WithCancel(r.Context())
+		cancel()
+		return handler.ServeHTTP(w, r.WithContext(ctx))
+	}))
+	if !errors.Is(err, context.Canceled) || canceled.Body.Len() != 0 ||
+		len(outer.runtime.slots) != 0 || len(inner.runtime.slots) != 1 {
+		t.Fatalf("canceled nested capture returned %v and body %q, slots %d/%d",
+			err, canceled.Body.String(), len(outer.runtime.slots), len(inner.runtime.slots))
+	}
+	<-inner.runtime.slots
 	allowed := httptest.NewRecorder()
 	if err := outer.ServeHTTP(allowed, request, handler); err != nil || allowed.Body.String() != "ok" {
 		t.Fatalf("nested capture with capacity returned %v and body %q", err, allowed.Body.String())

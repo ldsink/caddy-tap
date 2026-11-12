@@ -79,6 +79,10 @@ func TestCaddyfileAdapter(t *testing.T) {
 }
 
 func TestInvalidCaddyfile(t *testing.T) {
+	d := caddyfile.NewTestDispenser("tap unexpected")
+	if err := new(Tap).UnmarshalCaddyfile(d); err == nil || !strings.Contains(err.Error(), "wrong argument") {
+		t.Fatalf("unexpected directive argument: %v", err)
+	}
 	for _, tc := range []struct{ option, want string }{
 		{"identity second", "duplicate"},
 		{"bogus true", "unknown"},

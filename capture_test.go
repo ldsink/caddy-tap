@@ -3,6 +3,7 @@ package tap
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -20,6 +21,16 @@ func recordExchange(t *testing.T, w http.ResponseWriter, r *http.Request, limit 
 	var record exchange
 	err := capture(w, r, next, limit, "test", func(e exchange) { record = e })
 	return record, err
+}
+
+func TestCaptureInfersHTTPSForRelativeURL(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/path", nil)
+	req.TLS = &tls.ConnectionState{}
+	e, err := recordExchange(t, httptest.NewRecorder(), req, 0,
+		func(http.ResponseWriter, *http.Request) error { return nil })
+	if err != nil || e.Request.Scheme != "https" || e.Request.URL != "/path" {
+		t.Fatalf("request %+v, error %v", e.Request, err)
+	}
 }
 
 func TestCapturePreservesExchange(t *testing.T) {

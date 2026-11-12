@@ -2,6 +2,7 @@ package tap
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestRotationBySizeAndTime(t *testing.T) {
@@ -224,6 +226,46 @@ func TestInvalidRecordDoesNotCreateFile(t *testing.T) {
 	}
 }
 
+func TestFileSinkRecoversAfterMissingDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+	core, logs := observer.New(zap.WarnLevel)
+	s := fileSink{dir: dir, prefix: "api-", sizeLimit: 1 << 20, keep: 1, maxAge: -1, logger: zap.New(core)}
+	now := time.Now()
+	if err := s.write(now, exchange{}); !errors.Is(err, os.ErrNotExist) || s.file != nil || s.written != 0 {
+		t.Fatalf("write error %v, file %v, bytes %d", err, s.file, s.written)
+	}
+	if err := s.syncDir(); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sync error %v", err)
+	}
+	s.recover(now)
+	s.reportPrune(now)
+	for _, message := range []string{"could not scan tap logs for recovery", "could not prune tap logs"} {
+		if got := logs.FilterMessage(message).Len(); got != 1 {
+			t.Errorf("logged %q %d times", message, got)
+		}
+	}
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.reportClose(now) })
+	if err := s.write(now, exchange{Identity: "api"}); err != nil {
+		t.Fatal(err)
+	}
+	s.reportClose(now)
+	records, err := readExchanges(dir)
+	if err != nil || len(records) != 1 || records[0].Identity != "api" {
+		t.Fatalf("records %+v, error %v", records, err)
+	}
+}
+
+func TestRecoverPartMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.ndjson.part")
+	file, size, err := recoverPart(path)
+	if file != nil || size != 0 || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovered file %v, size %d, error %v", file, size, err)
+	}
+}
+
 func TestStrictFirstSyncFailureDiscardsNewFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "unsyncable")
@@ -345,6 +387,27 @@ func TestRetentionKeepsLatestWriteWithinSameSecond(t *testing.T) {
 	}
 	if got := oneLogFile(t, s.dir, "*.ndjson"); got != newer {
 		t.Fatalf("retained %q, want %q", got, newer)
+	}
+}
+
+func TestRetentionBreaksTimestampTieByName(t *testing.T) {
+	s := fileSink{dir: t.TempDir(), prefix: "api-", keep: 1, maxAge: -1}
+	now := time.Now().UTC().Truncate(time.Second)
+	stem := s.prefix + now.Format(fileTimeFormat)
+	for _, suffix := range []string{"-111.ndjson", "-999.ndjson"} {
+		path := filepath.Join(s.dir, stem+suffix)
+		if err := os.WriteFile(path, []byte("{}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.prune(now); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := oneLogFile(t, s.dir, "*.ndjson"), filepath.Join(s.dir, stem+"-999.ndjson"); got != want {
+		t.Fatalf("retained %q, want %q", got, want)
 	}
 }
 
