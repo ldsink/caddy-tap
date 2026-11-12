@@ -359,14 +359,25 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 	item := queuedRecord{}
 	if strict {
 		ctx := r.Context()
-		select {
-		case rt.slots <- struct{}{}:
-			if err := ctx.Err(); err != nil {
-				<-rt.slots
-				return err
+		if len(activeTaps) != 0 {
+			// An outer capture holds a slot while this handler runs.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case rt.slots <- struct{}{}:
+			default:
+				return caddyhttp.Error(http.StatusServiceUnavailable, fmt.Errorf("tap %q has no capture slot available for nested strict capture", t.Identity))
 			}
-		case <-ctx.Done():
-			return ctx.Err()
+		} else {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case rt.slots <- struct{}{}:
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			<-rt.slots
+			return err
 		}
 		item.result = make(chan error, 1)
 	}

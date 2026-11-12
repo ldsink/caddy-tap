@@ -529,3 +529,37 @@ func TestWriterLockContentionLeavesPartUntouched(t *testing.T) {
 		t.Fatalf("resumed %q, want %q", got, part)
 	}
 }
+
+func TestNestedStrictCaptureReturns503WhenFull(t *testing.T) {
+	dir := t.TempDir()
+	outer := &Tap{Identity: "outer", Directory: dir, Mode: "strict", QueueSize: 1}
+	inner := &Tap{Identity: "inner", Directory: dir, Mode: "strict", QueueSize: 1}
+	provision(t, outer)
+	provision(t, inner)
+
+	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), caddyhttp.VarsCtxKey, make(map[string]any)), time.Second)
+	defer cancel()
+	request := httptest.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
+	innerHandler := caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+		_, err := io.WriteString(w, "ok")
+		return err
+	})
+	handler := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		return inner.ServeHTTP(w, r, innerHandler)
+	})
+	inner.runtime.slots <- struct{}{}
+	blocked := httptest.NewRecorder()
+	err := outer.ServeHTTP(blocked, request, handler)
+	<-inner.runtime.slots
+	var httpErr caddyhttp.HandlerError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusServiceUnavailable || blocked.Body.Len() != 0 {
+		t.Fatalf("nested capture returned %v and body %q, want HTTP 503 before the next handler", err, blocked.Body.String())
+	}
+	if len(outer.runtime.slots) != 0 || len(inner.runtime.slots) != 0 {
+		t.Fatal("rejected nested capture leaked a slot")
+	}
+	allowed := httptest.NewRecorder()
+	if err := outer.ServeHTTP(allowed, request, handler); err != nil || allowed.Body.String() != "ok" {
+		t.Fatalf("nested capture with capacity returned %v and body %q", err, allowed.Body.String())
+	}
+}
