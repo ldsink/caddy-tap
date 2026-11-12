@@ -12,6 +12,7 @@
 - Cover normal behavior, edge cases, and relevant failure paths. Depending on the change, consider invalid input, I/O failures, request cancellation, concurrency, and resource cleanup. Verify both the result and the state after a failure.
 - Aim for high test coverage. Run `go test -cover ./...` and review uncovered branches affected by the change. For changes involving concurrency or shared state, run `go test -race ./...`.
 
-## Formatting
+## Commits
 
+- Create a separate commit for each completed, self-contained change.
 - Before every commit, run `make fmt` to format Go, Markdown, and YAML files. Include the formatting changes relevant to your work in the same commit.
