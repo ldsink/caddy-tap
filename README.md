@@ -18,6 +18,8 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
 
 ## Caddyfile
 
+### Snippet (recommended)
+
 We recommend defining each shared tap configuration once in a [Caddyfile snippet](https://caddyserver.com/docs/caddyfile/directives/import) and importing it wherever needed. This example captures `/api/*` and `/webhooks/*` using the same settings. Each import passes only the request matcher.
 
 ```caddyfile
@@ -44,6 +46,31 @@ We recommend defining each shared tap configuration once in a [Caddyfile snippet
     reverse_proxy localhost:9000
 }
 ```
+
+### Inline configuration
+
+For a single entry point, you can put the settings directly in a `tap` block. This example captures `/api/*`.
+
+```caddyfile
+:8080 {
+    @api path /api/*
+    tap @api {
+        identity api
+        directory /var/log/caddy/tap
+        mode drop
+        queue_size 64
+        max_body_bytes 1MiB
+        roll_size 100MiB
+        roll_interval 24h
+        roll_keep 10
+        roll_keep_for 720h
+    }
+
+    reverse_proxy localhost:9000
+}
+```
+
+Use either example as your Caddyfile, then validate and run it.
 
 ```sh
 /tmp/caddy-tap validate --config Caddyfile --adapter caddyfile

@@ -18,6 +18,8 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
 
 ## Caddyfile
 
+### Snippet 写法（推荐）
+
 推荐把共用的 tap 配置集中写在一个 [Caddyfile 片段（snippet）](https://caddyserver.com/docs/caddyfile/directives/import) 中，再在需要采集的入口用 `import` 引用。以下示例使用同一套设置采集 `/api/*` 和 `/webhooks/*`，每次引用只传入请求匹配器。
 
 ```caddyfile
@@ -44,6 +46,31 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
     reverse_proxy localhost:9000
 }
 ```
+
+### 直接配置
+
+只有一个采集入口时，也可以直接在 `tap` 块中填写设置。此示例采集 `/api/*`。
+
+```caddyfile
+:8080 {
+    @api path /api/*
+    tap @api {
+        identity api
+        directory /var/log/caddy/tap
+        mode drop
+        queue_size 64
+        max_body_bytes 1MiB
+        roll_size 100MiB
+        roll_interval 24h
+        roll_keep 10
+        roll_keep_for 720h
+    }
+
+    reverse_proxy localhost:9000
+}
+```
+
+任选一种示例作为 Caddyfile，然后验证并运行。
 
 ```sh
 /tmp/caddy-tap validate --config Caddyfile --adapter caddyfile
