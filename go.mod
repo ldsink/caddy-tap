@@ -6,6 +6,7 @@ require (
 	github.com/caddyserver/caddy/v2 v2.11.9
 	github.com/dustin/go-humanize v1.1.0
 	go.uber.org/zap v1.28.0
+	golang.org/x/net v0.60.0
 	golang.org/x/sys v0.48.0
 )
 
@@ -136,7 +137,6 @@ require (
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/crypto/x509roots/fallback v0.0.0-20261030153154-30a33513ff6d // indirect
 	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba // indirect
-	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/term v0.46.0 // indirect

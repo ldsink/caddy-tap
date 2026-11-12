@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"golang.org/x/net/http/httpguts"
 )
 
 type exchange struct {
@@ -260,6 +261,9 @@ func responseTrailers(committed, final http.Header) http.Header {
 	for _, declared := range committed.Values("Trailer") {
 		for name := range strings.SplitSeq(declared, ",") {
 			key := http.CanonicalHeaderKey(strings.TrimSpace(name))
+			if !httpguts.ValidTrailerHeader(key) {
+				continue
+			}
 			if values := final.Values(key); len(values) != 0 {
 				trailers[key] = append(trailers[key], values...)
 			}

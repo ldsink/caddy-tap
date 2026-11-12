@@ -253,3 +253,18 @@ func TestResponseTrailerOrderMatchesHTTP1(t *testing.T) {
 		t.Fatalf("HTTP trailers %v, logged trailers %v, want %v", resp.Trailer, got, want)
 	}
 }
+
+func TestCaptureSkipsForbiddenDeclaredTrailer(t *testing.T) {
+	e, err := recordExchange(t, httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil), 0,
+		func(w http.ResponseWriter, _ *http.Request) error {
+			w.Header().Set("Trailer", "Content-Length, X-End")
+			w.WriteHeader(http.StatusOK)
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("X-End", "done")
+			return nil
+		})
+	want := http.Header{"X-End": {"done"}}
+	if err != nil || !reflect.DeepEqual(e.Response.Trailer, want) {
+		t.Fatalf("trailers %v, want %v, error %v", e.Response.Trailer, want, err)
+	}
+}
