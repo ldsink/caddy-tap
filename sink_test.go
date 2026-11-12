@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,13 +33,25 @@ func TestRotationBySizeAndTime(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := fileSink{dir: t.TempDir(), prefix: "api-v2-", sizeLimit: tc.limit, interval: tc.interval, keep: -1, maxAge: -1, logger: zap.NewNop()}
-			t.Cleanup(s.reportClose)
+			t.Cleanup(func() { s.reportClose(time.Now()) })
 			now := time.Date(2026, 11, 11, 20, 0, 0, 987654321, time.FixedZone("UTC+8", 8*60*60))
 			if err := s.write(now, record); err != nil {
 				t.Fatal(err)
 			}
 			if err := s.write(now.Add(tc.elapsed), record); err != nil {
 				t.Fatal(err)
+			}
+			parts, err := filepath.Glob(filepath.Join(s.dir, "*.ndjson.part"))
+			if err != nil || len(parts) != 1 || parts[0] != s.file.Name() {
+				t.Fatalf("active parts %v, error %v", parts, err)
+			}
+			sealed, err := filepath.Glob(filepath.Join(s.dir, "*.ndjson"))
+			if err != nil || len(sealed) != tc.wantFiles-1 {
+				t.Fatalf("sealed files %v, error %v", sealed, err)
+			}
+			s.reportClose(now.Add(tc.elapsed))
+			if _, err := os.Stat(parts[0]); !os.IsNotExist(err) {
+				t.Fatalf("active part still exists after close: %v", err)
 			}
 			paths, err := filepath.Glob(filepath.Join(s.dir, "*.ndjson"))
 			if err != nil || len(paths) != tc.wantFiles {
@@ -83,12 +96,12 @@ func TestRetentionScopeAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := fileSink{dir: dir, prefix: "api-", sizeLimit: 1, keep: 1, maxAge: 24 * time.Hour, logger: zap.NewNop()}
-	t.Cleanup(s.reportClose)
+	t.Cleanup(func() { s.reportClose(time.Now()) })
 	if err := s.write(now, exchange{Identity: "api"}); err != nil {
 		t.Fatal(err)
 	}
 	paths, err := filepath.Glob(filepath.Join(dir, "*.ndjson"))
-	if err != nil || len(paths) != 5 {
+	if err != nil || len(paths) != 4 {
 		t.Fatalf("paths %v, error %v", paths, err)
 	}
 	for _, path := range paths {
@@ -100,13 +113,14 @@ func TestRetentionScopeAndRestart(t *testing.T) {
 
 func TestRetentionByAgeAlone(t *testing.T) {
 	s := fileSink{dir: t.TempDir(), prefix: "api-", sizeLimit: 1, keep: -1, maxAge: time.Hour, logger: zap.NewNop()}
-	t.Cleanup(s.reportClose)
+	t.Cleanup(func() { s.reportClose(time.Now()) })
 	now := time.Date(2026, 11, 11, 12, 0, 0, 987654321, time.UTC)
 	for _, stamp := range []time.Time{now.Add(-2 * time.Hour), now.Add(-time.Hour), now} {
 		if err := s.write(stamp, exchange{}); err != nil {
 			t.Fatal(err)
 		}
 	}
+	s.reportClose(now)
 	paths, err := filepath.Glob(filepath.Join(s.dir, "*.ndjson"))
 	if err != nil || len(paths) != 2 {
 		t.Fatalf("paths %v, error %v", paths, err)
@@ -116,7 +130,7 @@ func TestRetentionByAgeAlone(t *testing.T) {
 func TestRetentionWaitsForFirstSuccessfulRecord(t *testing.T) {
 	dir := t.TempDir()
 	s := fileSink{dir: dir, prefix: "api-", sizeLimit: 1 << 20, keep: 1, maxAge: time.Hour, strict: true, logger: zap.NewNop()}
-	t.Cleanup(s.reportClose)
+	t.Cleanup(func() { s.reportClose(time.Now()) })
 	now := time.Now()
 	expired := filepath.Join(dir, s.prefix+now.Add(-2*time.Hour).UTC().Format(fileTimeFormat)+"-123.ndjson")
 	if err := os.WriteFile(expired, []byte("{}\n"), 0600); err != nil {
@@ -157,7 +171,7 @@ func TestRetentionWaitsForFirstSuccessfulRecord(t *testing.T) {
 func TestFilePreservesNonUTF8Metadata(t *testing.T) {
 	dir := t.TempDir()
 	s := fileSink{dir: dir, prefix: "api-", sizeLimit: 1 << 20, keep: -1, maxAge: -1, logger: zap.NewNop()}
-	t.Cleanup(s.reportClose)
+	t.Cleanup(func() { s.reportClose(time.Now()) })
 	raw := string([]byte{0xff, 'x'})
 	header := http.Header{"X-Raw": {"plain", raw}, "X-Text": {"中文"}}
 	record := exchange{
@@ -172,6 +186,7 @@ func TestFilePreservesNonUTF8Metadata(t *testing.T) {
 	if err := s.write(record.Timestamp, record); err != nil {
 		t.Fatal(err)
 	}
+	s.reportClose(record.Timestamp)
 	records, err := readExchanges(dir)
 	if err != nil || len(records) != 1 {
 		t.Fatalf("records %+v, error %v", records, err)
@@ -228,5 +243,83 @@ func TestStrictFirstSyncFailureDiscardsNewFile(t *testing.T) {
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatalf("failed file remains eligible for retention: %v", err)
+	}
+}
+
+func TestRecoverySelectsNewestUsablePart(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().Truncate(time.Second)
+	s := fileSink{dir: dir, prefix: "api-", sizeLimit: 1 << 20, keep: -1, maxAge: -1, logger: zap.NewNop()}
+	part := func(prefix string, offset time.Duration, data string) string {
+		t.Helper()
+		stamp := now.Add(offset)
+		path := filepath.Join(dir, prefix+stamp.UTC().Format(fileTimeFormat)+"-123.ndjson.part")
+		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	older := part(s.prefix, -2*time.Hour, "{}\n")
+	usable := part(s.prefix, -time.Hour, "{}\n{")
+	corrupt := part(s.prefix, 0, "{}\n{\n")
+	empty := part(s.prefix, time.Hour, "{")
+	other := part("api-v2-", 0, "{}\n{")
+	s.recover(now)
+	t.Cleanup(func() { s.reportClose(now) })
+	if s.file == nil || s.file.Name() != usable || s.written != 3 || !s.opened.Equal(now.Add(-time.Hour)) {
+		t.Fatalf("recovered file %v, bytes %d, opened %v", s.file, s.written, s.opened)
+	}
+	for path, want := range map[string]string{
+		strings.TrimSuffix(older, partSuffix): "{}\n",
+		usable:                                "{}\n",
+		corrupt:                               "{}\n{\n",
+		other:                                 "{}\n{",
+	} {
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != want {
+			t.Fatalf("%s contains %q, want %q, error %v", path, got, want, err)
+		}
+	}
+	for _, path := range []string{older, empty} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("unexpected part %s: %v", path, err)
+		}
+	}
+	s.interval = time.Hour
+	if err := s.write(now, exchange{}); err != nil {
+		t.Fatal(err)
+	}
+	if s.file.Name() == usable {
+		t.Fatal("expired recovered file was reopened for append")
+	}
+	if got, err := os.ReadFile(strings.TrimSuffix(usable, partSuffix)); err != nil || string(got) != "{}\n" {
+		t.Fatalf("expired file contains %q, error %v", got, err)
+	}
+}
+
+func TestFinalizationDoesNotOverwriteExistingLog(t *testing.T) {
+	now := time.Now()
+	s := fileSink{dir: t.TempDir(), prefix: "api-", sizeLimit: 1 << 20, keep: -1, maxAge: -1, logger: zap.NewNop()}
+	if err := s.write(now, exchange{}); err != nil {
+		t.Fatal(err)
+	}
+	part := s.file.Name()
+	final := strings.TrimSuffix(part, partSuffix)
+	if err := os.WriteFile(final, []byte("previous\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s.reportClose(now)
+	s.recover(now)
+	if s.file != nil {
+		t.Fatal("recovered a part whose final name is in use")
+	}
+	if data, err := os.ReadFile(final); err != nil || string(data) != "previous\n" {
+		t.Fatalf("existing final contains %q, error %v", data, err)
+	}
+	if data, err := os.ReadFile(part); err != nil || !json.Valid(data) {
+		t.Fatalf("part contains %q, error %v", data, err)
 	}
 }

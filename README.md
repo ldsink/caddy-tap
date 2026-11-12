@@ -46,17 +46,17 @@ This configuration captures only `/api/*`. Remove `@api` to enable capture for t
 
 | Parameter        | Default  | Behavior                                                                                                                                                                                 |
 | ---------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `identity`       | Required | 1–64 ASCII letters, digits, underscores, or hyphens. Must start with a letter or digit. Use distinct identities for tap blocks sharing a directory.                                      |
+| `identity`       | Required | 1–64 ASCII letters, digits, underscores, or hyphens. Must start with a letter or digit. Reuse the identity to share files across routes in the same directory.                           |
 | `directory`      | Required | Output directory. Relative paths resolve against the Caddy process's working directory. New directories have permissions `0700`.                                                         |
 | `mode`           | `drop`   | `drop` discards the entire capture record when capacity runs out. `strict` waits for capacity, disables body truncation, and waits for the log file to sync.                             |
-| `queue_size`     | `64`     | Maximum number of exchanges being captured, queued, or written per configured instance, from 1 to 65536.                                                                                 |
+| `queue_size`     | `64`     | Maximum number of exchanges being captured, queued, or written per directory and identity, from 1 to 65536.                                                                              |
 | `max_body_bytes` | `1MiB`   | In default mode, the byte limit applies separately to request and response bodies. The log still reports the total observed bytes and flags truncation. Omit this option in strict mode. |
 | `roll_size`      | `100MiB` | Rotates before appending a record that would exceed the threshold. A record larger than the threshold gets its own file.                                                                 |
-| `roll_interval`  | Disabled | Rotates on the next write after the specified time has elapsed since the current file was created. Supports durations such as `24h` and `1d`.                                            |
+| `roll_interval`  | Disabled | Seals the current file when the specified time has elapsed since it was created, even without another write. Supports durations such as `24h` and `1d`.                                  |
 | `roll_keep`      | `10`     | Maximum number of closed files to keep for the same directory and identity. Set to `-1` to disable the limit.                                                                            |
 | `roll_keep_for`  | `2160h`  | Maximum retention age for closed files, based on the UTC timestamp in the filename. Set to `-1` to disable the limit.                                                                    |
 
-Size settings accept byte counts and units such as `KiB` and `MiB`. Retention runs after the first record is successfully written to a new file and applies all enabled limits. No scheduled deletion runs while idle. Use separate output directories or identities for multiple Caddy processes so each can manage its own retention.
+Size settings accept byte counts and units such as `KiB` and `MiB`. Retention runs after the first successful write to a new file and after a file is sealed. It only considers sealed files.
 
 ## JSON configuration
 
@@ -76,17 +76,24 @@ Place this object in the HTTP route's `handle` array before the handler you want
 }
 ```
 
+## Log files and uploads
+
+Routes with the same resolved output directory and identity share one queue, writer and current file. They must agree on `queue_size` and all `roll_*` settings, including while old and new configurations overlap during a reload. Changing these settings for a live group requires a restart. Capture mode and body limits are set per route. Nested routes in the same group capture the request once at the outermost invocation.
+
+The writer creates files such as `api-20261111T120000-123456789.ndjson.part` with permissions `0600`. After a size or time rotation or graceful shutdown, it syncs and closes the file before renaming it in the same directory to `api-20261111T120000-123456789.ndjson`. Failed finalization leaves the part for recovery.
+
+On the first captured record after startup, the writer locks the group and checks for leftover parts. It keeps complete JSON lines, truncates a torn final line and resumes the most recently modified usable part with its original creation timestamp and existing byte count. It seals older usable parts, removes empty parts and leaves files with invalid complete lines or I/O errors in place for inspection. Rotation limits still apply to the resumed file. Use separate directories or identities for multiple Caddy processes, and leave the hidden `.tap-<identity>.lock` files in place. Configuration validation leaves existing log files untouched.
+
+Upload only finalized `*.ndjson` files. When upgrading from a version that wrote directly to `.ndjson`, stop the old process before enabling the uploader. Scan on startup and periodically to catch files missed by the directory watcher. If the uploader must keep every file until upload succeeds, set both `roll_keep` and `roll_keep_for` to `-1` and let the uploader delete the local file after success.
+
 ## Log format and capture boundaries
 
-- Filenames look like `api-20261111T120000-123456789.ndjson`. They contain the identity, a UTC timestamp with second precision, and a numeric suffix to avoid collisions. Retention applies to files in this format. New files have permissions `0600`.
 - Each line contains `identity`, `timestamp`, `duration_ns`, `request`, and `response`. Request fields include `method`, `url`, `request_uri`, `host`, `scheme`, `protocol`, `remote_addr`, `content_length`, and `transfer_encoding` when available. Use `scheme` and `host` with a relative URL. Request and response `header` and `trailer` fields preserve repeated values in string arrays. The response also includes `status`, with `informational` and `hijacked` when available.
 - When a header or trailer value contains non-UTF-8 bytes, `header_base64` or `trailer_base64` stores every raw value for that name in the same order as the text field. Use `url_base64` or `request_uri_base64` to recover the original bytes of a non-UTF-8 URL or request target.
 - Decode `body_base64` to recover the captured bytes. The field is `null` when no bytes were captured. `body_bytes` is the total number of bytes observed by the middleware, and `body_truncated` flags truncation at the capture limit. For requests, `body_complete` indicates that tap observed EOF or that the full known length was read. Tap records I/O errors in `body_error` and errors returned by downstream handlers in `error`. If a downstream handler panics, tap records `aborted: true` and lets Caddy handle the panic.
 - Capture happens at the Caddy handler boundary. Tap copies only the request body bytes that downstream handlers read and the response body bytes that the writer accepts. Headers added later by the server, responses generated outside the handler chain, and bytes written directly to an upgraded connection are outside this boundary. `status: 0` means tap observed no final status being committed. This can happen with an empty handler, Caddy's outer error handling, or an upgrade handshake written directly to the connection.
 - In default mode, tap aggregates counts of records dropped due to capacity and reports write errors in the background. During a hot reload, the old configuration continues recording exchanges it has already started capturing. Graceful shutdown drains queued records. In-flight requests that exceed Caddy's shutdown grace period and records still pending on forced termination may be lost.
 - In strict mode, tap holds captured data in memory and waits for the file to sync before the handler returns. A request canceled while waiting for capture capacity stops waiting. Queued records are still written. Response bytes streamed to the client may arrive before the sync completes. Tap reports disk write failures in the Caddy log and returns HTTP 500 if the response is still uncommitted and the downstream handler returned no error. Large bodies increase memory use, and slow disks increase request latency.
-
-If the same request re-enters the same tap instance in a named route, the outer invocation records it once.
 
 Logs store credentials, cookies, query parameters, and bodies as received. Use a directory accessible only to Caddy and authorized readers.
 

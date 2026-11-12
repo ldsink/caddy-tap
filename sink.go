@@ -1,27 +1,28 @@
 package tap
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
 	"go.uber.org/zap"
 )
 
-const fileTimeFormat = "20060102T150405"
-
-// Config reloads can briefly leave two workers writing for the same identity.
-var activeFiles = struct {
-	sync.Mutex
-	paths map[string]bool
-}{paths: make(map[string]bool)}
+const (
+	fileTimeFormat = "20060102T150405"
+	partSuffix     = ".part"
+	logSuffix      = ".ndjson"
+)
 
 type fileSink struct {
 	dir, prefix string
@@ -32,9 +33,10 @@ type fileSink struct {
 	strict      bool
 	logger      *zap.Logger
 
-	file    *os.File
-	opened  time.Time
-	written int64
+	file      *os.File
+	opened    time.Time
+	written   int64
+	syncedDir bool
 }
 
 func (s *fileSink) write(now time.Time, record exchange) error {
@@ -46,7 +48,7 @@ func (s *fileSink) write(now time.Time, record exchange) error {
 	size := int64(len(data))
 	if s.file != nil && s.written > 0 &&
 		(size > s.sizeLimit-s.written || (s.interval > 0 && now.Sub(s.opened) >= s.interval)) {
-		s.reportClose()
+		s.reportClose(now)
 	}
 	if s.file == nil {
 		if err := s.open(now); err != nil {
@@ -55,25 +57,21 @@ func (s *fileSink) write(now time.Time, record exchange) error {
 	}
 	firstRecord := s.written == 0
 	n, err := s.file.Write(data)
+	if err == nil && s.strict {
+		err = s.file.Sync()
+		if err == nil && !s.syncedDir {
+			err = s.syncDir()
+			s.syncedDir = err == nil
+		}
+	}
 	if err != nil {
 		rollback := s.file.Truncate(s.written)
-		s.reportClose()
+		s.finish(now, rollback == nil)
 		return errors.Join(err, rollback)
-	}
-	if s.strict {
-		if err := s.file.Sync(); err != nil {
-			s.reportClose()
-			return err
-		}
 	}
 	s.written += int64(n)
 	if firstRecord {
-		activeFiles.Lock()
-		err := s.prune(now)
-		activeFiles.Unlock()
-		if err != nil {
-			s.logger.Warn("could not prune tap logs", zap.Error(err))
-		}
+		s.reportPrune(now)
 	}
 	return nil
 }
@@ -121,48 +119,178 @@ func originalHeaderBytes(header http.Header) map[string][][]byte {
 }
 
 func (s *fileSink) open(now time.Time) error {
-	activeFiles.Lock()
-	defer activeFiles.Unlock()
-	file, err := os.CreateTemp(s.dir, s.prefix+now.UTC().Format(fileTimeFormat)+"-*.ndjson")
+	for {
+		file, err := os.CreateTemp(s.dir, s.prefix+now.UTC().Format(fileTimeFormat)+"-*"+logSuffix+partSuffix)
+		if err != nil {
+			return err
+		}
+		err = checkFinalName(file.Name())
+		if err == nil {
+			s.file = file
+			s.opened = now
+			s.written = 0
+			s.syncedDir = false
+			return nil
+		}
+		cleanup := errors.Join(file.Close(), os.Remove(file.Name()))
+		if cleanup != nil || !errors.Is(err, os.ErrExist) {
+			return errors.Join(err, cleanup)
+		}
+	}
+}
+
+func checkFinalName(part string) error {
+	final := strings.TrimSuffix(part, partSuffix)
+	_, err := os.Lstat(final)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	case err != nil:
+		return err
+	default:
+		return &os.PathError{Op: "publish tap log", Path: final, Err: os.ErrExist}
+	}
+}
+
+func (s *fileSink) syncDir() error {
+	dir, err := os.Open(s.dir)
 	if err != nil {
 		return err
 	}
-	if s.strict {
-		dir, err := os.Open(s.dir)
-		if err == nil {
-			err = errors.Join(dir.Sync(), dir.Close())
-		}
-		if err != nil {
-			return errors.Join(err, file.Close(), os.Remove(file.Name()))
-		}
-	}
-	s.file = file
-	s.opened = now
-	s.written = 0
-	activeFiles.paths[file.Name()] = true
-	return nil
+	return errors.Join(dir.Sync(), dir.Close())
 }
 
-func (s *fileSink) reportClose() {
+func (s *fileSink) reportClose(now time.Time) {
+	s.finish(now, true)
+}
+
+func (s *fileSink) finish(now time.Time, publish bool) {
 	if s.file == nil {
 		return
 	}
-	activeFiles.Lock()
-	err := s.file.Close()
+	file := s.file
+	s.file = nil
+	var err error
+	if s.written > 0 && publish {
+		err = file.Sync()
+	}
+	err = errors.Join(err, file.Close())
+	path := file.Name()
 	if s.written == 0 {
-		if removeErr := os.Remove(s.file.Name()); !errors.Is(removeErr, os.ErrNotExist) {
+		if removeErr := os.Remove(path); !errors.Is(removeErr, os.ErrNotExist) {
 			err = errors.Join(err, removeErr)
 		}
+	} else if publish && err == nil {
+		if err = checkFinalName(path); err == nil {
+			err = os.Rename(path, strings.TrimSuffix(path, partSuffix))
+		}
+		if err == nil {
+			if s.syncedDir {
+				err = s.syncDir()
+			}
+			s.reportPrune(now)
+		}
 	}
-	delete(activeFiles.paths, s.file.Name())
-	s.file = nil
-	activeFiles.Unlock()
 	if err != nil {
-		s.logger.Error("could not close tap log", zap.Error(err))
+		s.logger.Error("could not finalize tap log", zap.String("path", path), zap.Error(err))
 	}
 }
 
-// prune runs while holding activeFiles. Within the same second, the numeric suffix breaks ties by filename order.
+func (s *fileSink) recover(now time.Time) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		s.logger.Error("could not scan tap logs for recovery", zap.Error(err))
+		return
+	}
+	type part struct {
+		name             string
+		opened, modified time.Time
+	}
+	var parts []part
+	for _, entry := range entries {
+		stamp, ok := s.fileStamp(entry, logSuffix+partSuffix)
+		if !ok {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			s.logger.Warn("could not inspect tap log part", zap.String("name", entry.Name()), zap.Error(err))
+			continue
+		}
+		parts = append(parts, part{entry.Name(), stamp, info.ModTime()})
+	}
+	// ReadDir orders by filename, which breaks ties between equal modification times.
+	slices.SortStableFunc(parts, func(a, b part) int { return b.modified.Compare(a.modified) })
+	for _, part := range parts {
+		path := filepath.Join(s.dir, part.name)
+		file, size, err := recoverPart(path)
+		if err != nil {
+			s.logger.Warn("could not recover tap log part", zap.String("path", path), zap.Error(err))
+			continue
+		}
+		if size > 0 && s.file == nil {
+			s.file, s.written, s.opened = file, size, part.opened
+			continue
+		}
+		older := *s
+		older.file, older.written = file, size
+		older.reportClose(now)
+	}
+}
+
+func recoverPart(path string) (*os.File, int64, error) {
+	if err := checkFinalName(path); err != nil {
+		return nil, 0, err
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	reader := bufio.NewReader(file)
+	var size int64
+	for {
+		line, err := reader.ReadBytes('\n')
+		if errors.Is(err, io.EOF) {
+			if len(line) != 0 {
+				err = file.Truncate(size)
+			} else {
+				err = nil
+			}
+			if err == nil {
+				if _, err = file.Seek(size, io.SeekStart); err == nil {
+					return file, size, nil
+				}
+			}
+		}
+		if err != nil {
+			return nil, 0, errors.Join(err, file.Close())
+		}
+		record := bytes.TrimSpace(line)
+		if len(record) == 0 || record[0] != '{' || !json.Valid(record) {
+			return nil, 0, errors.Join(fmt.Errorf("invalid NDJSON record at offset %d", size), file.Close())
+		}
+		size += int64(len(line))
+	}
+}
+
+func (s *fileSink) fileStamp(entry os.DirEntry, extension string) (time.Time, bool) {
+	suffix, matchesIdentity := strings.CutPrefix(entry.Name(), s.prefix)
+	stem, matchesExtension := strings.CutSuffix(suffix, extension)
+	if !matchesIdentity || !matchesExtension || !entry.Type().IsRegular() ||
+		len(stem) <= len(fileTimeFormat)+1 || stem[len(fileTimeFormat)] != '-' ||
+		strings.Trim(stem[len(fileTimeFormat)+1:], "0123456789") != "" {
+		return time.Time{}, false
+	}
+	stamp, err := time.Parse(fileTimeFormat, stem[:len(fileTimeFormat)])
+	return stamp, err == nil
+}
+
+func (s *fileSink) reportPrune(now time.Time) {
+	if err := s.prune(now); err != nil {
+		s.logger.Warn("could not prune tap logs", zap.Error(err))
+	}
+}
+
 func (s *fileSink) prune(now time.Time) error {
 	if s.keep < 0 && s.maxAge < 0 {
 		return nil
@@ -175,24 +303,12 @@ func (s *fileSink) prune(now time.Time) error {
 	var removeErr error
 	for i := len(entries) - 1; i >= 0; i-- {
 		entry := entries[i]
-		suffix, ok := strings.CutPrefix(entry.Name(), s.prefix)
-		if !ok || !entry.Type().IsRegular() || !strings.HasSuffix(suffix, ".ndjson") ||
-			len(suffix) <= len(fileTimeFormat)+1 || suffix[len(fileTimeFormat)] != '-' {
-			continue
-		}
-		stamp, err := time.Parse(fileTimeFormat, suffix[:len(fileTimeFormat)])
-		if err != nil {
-			continue
-		}
-		token := strings.TrimSuffix(suffix[len(fileTimeFormat)+1:], ".ndjson")
-		if token == "" || strings.Trim(token, "0123456789") != "" {
-			continue
-		}
-		path := filepath.Join(s.dir, entry.Name())
-		if activeFiles.paths[path] {
+		stamp, ok := s.fileStamp(entry, logSuffix)
+		if !ok {
 			continue
 		}
 		if (s.maxAge > 0 && now.Truncate(time.Second).Sub(stamp) > s.maxAge) || (s.keep >= 0 && kept >= s.keep) {
+			path := filepath.Join(s.dir, entry.Name())
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				removeErr = errors.Join(removeErr, err)
 			}

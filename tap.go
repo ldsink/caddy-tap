@@ -20,6 +20,11 @@ import (
 
 var workers sync.Map
 
+var writerGroups = struct {
+	sync.Mutex
+	byPath map[string]*tapRuntime
+}{byPath: make(map[string]*tapRuntime)}
+
 const activeTapsVar = "http.handlers.tap.active"
 
 func init() {
@@ -56,10 +61,21 @@ type Tap struct {
 	RollKeep     int            `json:"roll_keep,omitempty"`
 	RollKeepFor  caddy.Duration `json:"roll_keep_for,omitempty"`
 
-	runtime *tapRuntime
+	runtime  *tapRuntime
+	released bool // guarded by runtime.mu
+}
+
+type writerSettings struct {
+	queueSize int
+	sizeLimit int64
+	interval  time.Duration
+	keep      int
+	maxAge    time.Duration
 }
 
 type tapRuntime struct {
+	settings   writerSettings
+	refs       int
 	mu         sync.Mutex
 	stopping   bool
 	active     int
@@ -136,29 +152,88 @@ func (t *Tap) Provision(ctx caddy.Context) error {
 	if err != nil {
 		return err
 	}
+	settings := writerSettings{t.QueueSize, t.RollSize, time.Duration(t.RollInterval), t.RollKeep, time.Duration(t.RollKeepFor)}
+	lockPath := filepath.Join(dir, ".tap-"+t.Identity+".lock")
+	for {
+		writerGroups.Lock()
+		rt := writerGroups.byPath[lockPath]
+		if rt == nil {
+			defer writerGroups.Unlock()
+			break
+		}
+		rt.mu.Lock()
+		if rt.closed {
+			rt.mu.Unlock()
+			writerGroups.Unlock()
+			<-rt.done
+			continue
+		}
+		if rt.settings != settings {
+			rt.mu.Unlock()
+			writerGroups.Unlock()
+			return fmt.Errorf("tap %q in %s has conflicting queue or rotation/retention settings", t.Identity, dir)
+		}
+		rt.refs++
+		rt.stopping = false
+		t.runtime = rt
+		rt.mu.Unlock()
+		writerGroups.Unlock()
+		return nil
+	}
 	logger := ctx.Logger().With(zap.String("identity", t.Identity))
-	t.runtime = &tapRuntime{
+	rt := &tapRuntime{
+		settings: settings, refs: 1,
 		slots:      make(chan struct{}, t.QueueSize),
 		queue:      make(chan queuedRecord, t.QueueSize),
 		done:       make(chan struct{}),
 		dropNotice: make(chan struct{}, 1),
 		logger:     logger,
 	}
+	t.runtime = rt
 	sink := fileSink{
 		dir: dir, prefix: t.Identity + "-",
-		sizeLimit: t.RollSize, interval: time.Duration(t.RollInterval),
-		keep: t.RollKeep, maxAge: time.Duration(t.RollKeepFor),
-		strict: t.Mode == "strict", logger: logger,
+		sizeLimit: settings.sizeLimit, interval: settings.interval,
+		keep: settings.keep, maxAge: settings.maxAge,
+		logger: logger,
 	}
-	workers.Store(t.runtime, struct{}{})
-	go t.runtime.writeRecords(&sink)
+	writerGroups.byPath[lockPath] = rt
+	workers.Store(rt, struct{}{})
+	go rt.writeRecords(&sink, lockPath)
 	return nil
 }
 
-func (rt *tapRuntime) writeRecords(sink *fileSink) {
-	defer workers.Delete(rt)
+func lockWriter(path string) (*os.File, error) {
+	lock, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := tryLock(lock); err != nil {
+		_ = lock.Close()
+		return nil, fmt.Errorf("could not lock tap log group %q: %w", path, err)
+	}
+	return lock, nil
+}
+
+func (rt *tapRuntime) writeRecords(sink *fileSink, lockPath string) {
 	defer close(rt.done)
-	defer sink.reportClose()
+	defer workers.Delete(rt)
+	var lock *os.File
+	if lockPath != "" {
+		defer func() {
+			writerGroups.Lock()
+			if lock != nil {
+				if err := lock.Close(); err != nil {
+					rt.logger.Error("could not release tap log group lock", zap.Error(err))
+				}
+			}
+			delete(writerGroups.byPath, lockPath)
+			writerGroups.Unlock()
+		}()
+	}
+	defer func() { sink.reportClose(time.Now()) }()
+	timer := time.NewTimer(0)
+	timer.Stop()
+	defer timer.Stop()
 	var reportedDrops uint64
 	reportDrops := func() {
 		if dropped := rt.dropped.Load(); dropped > reportedDrops {
@@ -168,14 +243,32 @@ func (rt *tapRuntime) writeRecords(sink *fileSink) {
 	}
 	defer reportDrops()
 	for {
+		var expiry <-chan time.Time
+		if sink.file != nil && sink.interval > 0 {
+			timer.Reset(time.Until(sink.opened.Add(sink.interval)))
+			expiry = timer.C
+		}
 		select {
+		case now := <-expiry:
+			sink.reportClose(now)
 		case <-rt.dropNotice:
 			reportDrops()
 		case item, ok := <-rt.queue:
 			if !ok {
 				return
 			}
-			err := sink.write(time.Now(), item.record)
+			var err error
+			if lock == nil && lockPath != "" {
+				// Caddy also provisions handlers during config validation.
+				lock, err = lockWriter(lockPath)
+				if err == nil {
+					sink.recover(time.Now())
+				}
+			}
+			if err == nil {
+				sink.strict = item.result != nil
+				err = sink.write(time.Now(), item.record)
+			}
 			if err != nil {
 				rt.logger.Error("could not write HTTP exchange", zap.Error(err))
 			}
@@ -193,6 +286,16 @@ func (t *Tap) Cleanup() error {
 	}
 	rt := t.runtime
 	rt.mu.Lock()
+	if !t.released {
+		t.released = true
+		if rt.refs > 0 {
+			rt.refs--
+		}
+	}
+	if rt.refs != 0 {
+		rt.mu.Unlock()
+		return nil
+	}
 	rt.stopping = true
 	idle := rt.active == 0
 	if idle {
@@ -223,7 +326,7 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 	}
 	strict := t.Mode == "strict"
 	rt.mu.Lock()
-	if rt.stopping {
+	if t.released || rt.stopping {
 		rt.mu.Unlock()
 		return next.ServeHTTP(w, r)
 	}
@@ -267,7 +370,7 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 		}
 		item.result = make(chan error, 1)
 	}
-	// A named route can invoke the same Tap again before its first invocation returns.
+	// A nested route using this writer would otherwise wait on its own strict slot.
 	if vars != nil {
 		if activeTaps == nil {
 			activeTaps = make(map[*tapRuntime]bool)

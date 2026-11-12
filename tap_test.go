@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -146,36 +148,67 @@ func TestStrictPersistenceFailureBeforeCommit(t *testing.T) {
 	}
 }
 
-func TestConcurrentStrictRecordsAndReload(t *testing.T) {
+func TestConcurrentPathsShareWriter(t *testing.T) {
 	dir := t.TempDir()
-	first := &Tap{Identity: "api", Directory: dir, Mode: "strict", QueueSize: 4, RollKeep: 1}
-	second := &Tap{Identity: "api", Directory: dir, Mode: "strict", QueueSize: 4, RollKeep: 1}
+	first := &Tap{Identity: "api", Directory: dir, Mode: "strict", QueueSize: 4}
+	second := &Tap{Identity: "api", Directory: dir, Mode: "strict", QueueSize: 4}
 	provision(t, first)
 	provision(t, second)
+	if first.runtime != second.runtime {
+		t.Fatal("paths use different writers")
+	}
 	var wg sync.WaitGroup
 	for range 24 {
-		for _, tap := range []*Tap{first, second} {
-			wg.Go(func() {
-				err := tap.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/concurrent", nil),
-					caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
-						_, err := io.WriteString(w, "done")
-						return err
-					}))
-				if err != nil {
-					t.Error(err)
-				}
-			})
-		}
+		wg.Go(func() { captureTestPath(t, first, "/first") })
+		wg.Go(func() { captureTestPath(t, second, "/second") })
 	}
 	wg.Wait()
+	wg.Go(func() { _ = first.Cleanup() })
+	wg.Go(func() { _ = first.Cleanup() })
+	wg.Wait()
+	captureTestPath(t, second, "/second")
+	part := oneLogFile(t, dir, "*.ndjson.part")
+	if paths, err := filepath.Glob(filepath.Join(dir, "*.ndjson")); err != nil || len(paths) != 0 {
+		t.Fatalf("a path cleanup published the shared file early: %v, %v", paths, err)
+	}
+	if err := second.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if got := oneLogFile(t, dir, "*.ndjson"); got+partSuffix != part {
+		t.Fatalf("published %q, want %q", got, strings.TrimSuffix(part, partSuffix))
+	}
 	records, err := readExchanges(dir)
-	if err != nil || len(records) != 48 {
-		t.Fatalf("got %d records, error %v", len(records), err)
+	counts := make(map[string]int)
+	for _, record := range records {
+		if string(record.Response.Data) != "done" {
+			t.Fatalf("incomplete record: %+v", record)
+		}
+		counts[record.Request.URL]++
 	}
-	wg.Go(func() { _ = first.Cleanup() })
-	wg.Go(func() { _ = first.Cleanup() })
-	wg.Go(func() { _ = second.Cleanup() })
-	wg.Wait()
+	if err != nil || len(counts) != 2 || counts["/first"] != 24 || counts["/second"] != 25 {
+		t.Fatalf("records by path %v, error %v", counts, err)
+	}
+}
+
+func captureTestPath(t *testing.T, tap *Tap, path string) {
+	t.Helper()
+	err := tap.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, nil),
+		caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+			_, err := io.WriteString(w, "done")
+			return err
+		}))
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+func oneLogFile(t *testing.T, dir, pattern string) string {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(dir, pattern))
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("want one %s file, got %v, error %v", pattern, paths, err)
+	}
+	return paths[0]
 }
 
 func TestStrictAdmissionHonorsCancellation(t *testing.T) {
@@ -219,16 +252,24 @@ func TestRepeatedNamedRouteDoesNotWaitOnItself(t *testing.T) {
 	dir := t.TempDir()
 	tap := &Tap{Identity: "api", Directory: dir, Mode: "strict", QueueSize: 1}
 	provision(t, tap)
+	nested := &Tap{Identity: "api", Directory: dir, Mode: "strict", QueueSize: 1}
+	provision(t, nested)
 	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), caddyhttp.VarsCtxKey, make(map[string]any)), time.Second)
 	defer cancel()
 	w := httptest.NewRecorder()
 	err := tap.ServeHTTP(w, httptest.NewRequestWithContext(ctx, http.MethodGet, "/", nil),
 		caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-			return tap.ServeHTTP(w, r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+			return nested.ServeHTTP(w, r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
 				_, err := io.WriteString(w, "done")
 				return err
 			}))
 		}))
+	if err := tap.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if err := nested.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
 	records, readErr := readExchanges(dir)
 	if err != nil || readErr != nil || len(records) != 1 || w.Body.String() != "done" || string(records[0].Response.Data) != "done" {
 		t.Fatalf("response %q, records %+v, errors %v and %v", w.Body.String(), records, err, readErr)
@@ -307,7 +348,7 @@ func TestDropWarningDuringAnActiveExchange(t *testing.T) {
 		dropNotice: make(chan struct{}, 1), done: make(chan struct{}), logger: logger,
 	}
 	rt.slots <- struct{}{}
-	go rt.writeRecords(&fileSink{logger: logger})
+	go rt.writeRecords(&fileSink{logger: logger}, "")
 	tap := &Tap{Identity: "api", runtime: rt}
 	t.Cleanup(func() { _ = tap.Cleanup() })
 	w := httptest.NewRecorder()
@@ -347,5 +388,143 @@ func TestStrictPersistenceFailurePreservesCommittedResponse(t *testing.T) {
 		}))
 	if err != nil || w.Code != http.StatusAccepted || w.Body.String() != "committed" {
 		t.Fatalf("status %d, response %q, error %v", w.Code, w.Body.String(), err)
+	}
+}
+
+func TestRecoveryAfterProcessExit(t *testing.T) {
+	const childDir = "CADDY_TAP_TEST_CRASH_DIR"
+	if dir := os.Getenv(childDir); dir != "" {
+		tap := &Tap{Identity: "api", Directory: dir, Mode: "strict"}
+		provision(t, tap)
+		captureTestPath(t, tap, "/before-restart")
+		path := oneLogFile(t, dir, "*.ndjson.part")
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteString(`{"request":`); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if t.Failed() {
+			os.Exit(1)
+		}
+		os.Exit(0) // Leave the writer and its lock open until the process exits.
+	}
+
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRecoveryAfterProcessExit$")
+	cmd.Env = append(os.Environ(), childDir+"="+dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("crash fixture: %v, %s", err, out)
+	}
+	part := oneLogFile(t, dir, "*.ndjson.part")
+	before, err := os.ReadFile(part)
+	if err != nil || !bytes.HasSuffix(before, []byte(`{"request":`)) {
+		t.Fatalf("missing torn tail: %v", err)
+	}
+	validation := &Tap{Identity: "api", Directory: dir}
+	provision(t, validation)
+	if err := validation.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if unchanged, err := os.ReadFile(part); err != nil || !bytes.Equal(unchanged, before) {
+		t.Fatalf("config validation touched the part: %v", err)
+	}
+	first := &Tap{Identity: "api", Directory: dir, Mode: "strict"}
+	second := &Tap{Identity: "api", Directory: dir, Mode: "strict"}
+	provision(t, first)
+	provision(t, second)
+	var wg sync.WaitGroup
+	wg.Go(func() { captureTestPath(t, first, "/first-after-restart") })
+	wg.Go(func() { captureTestPath(t, second, "/second-after-restart") })
+	wg.Wait()
+	if got := oneLogFile(t, dir, "*.ndjson.part"); got != part {
+		t.Fatalf("resumed %q, want %q", got, part)
+	}
+	_ = first.Cleanup()
+	_ = second.Cleanup()
+	oneLogFile(t, dir, "*.ndjson")
+	records, err := readExchanges(dir)
+	if err != nil || len(records) != 3 || records[0].Request.URL != "/before-restart" {
+		t.Fatalf("recovered records %+v, error %v", records, err)
+	}
+	urls := map[string]bool{}
+	for _, record := range records[1:] {
+		urls[record.Request.URL] = true
+	}
+	if !urls["/first-after-restart"] || !urls["/second-after-restart"] {
+		t.Fatalf("missing path in recovered log: %v", urls)
+	}
+}
+
+func TestSharedWriterRejectsConflictingSettings(t *testing.T) {
+	dir := t.TempDir()
+	tap := &Tap{Identity: "api", Directory: dir, QueueSize: 2}
+	provision(t, tap)
+	conflict := &Tap{Identity: "api", Directory: dir, QueueSize: 3}
+	if err := conflict.Provision(caddy.Context{}); err == nil || !strings.Contains(err.Error(), "conflicting") {
+		t.Fatalf("conflicting settings: %v", err)
+	}
+	if conflict.runtime != nil || tap.runtime.refs != 1 {
+		t.Fatal("failed provision changed the writer group")
+	}
+}
+
+func TestIdleRotationPublishesPart(t *testing.T) {
+	dir := t.TempDir()
+	tap := &Tap{Identity: "api", Directory: dir, Mode: "strict", RollInterval: caddy.Duration(50 * time.Millisecond)}
+	provision(t, tap)
+	captureTestPath(t, tap, "/idle")
+	for deadline := time.Now().Add(3 * time.Second); ; {
+		paths, err := filepath.Glob(filepath.Join(dir, "*.ndjson"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(paths) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("idle writer did not publish its file")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if parts, err := filepath.Glob(filepath.Join(dir, "*.ndjson.part")); err != nil || len(parts) != 0 {
+		t.Fatalf("idle writer left parts %v, error %v", parts, err)
+	}
+}
+
+func TestWriterLockContentionLeavesPartUntouched(t *testing.T) {
+	dir := t.TempDir()
+	lock, err := lockWriter(filepath.Join(dir, ".tap-api.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	part := filepath.Join(dir, "api-"+time.Now().UTC().Format(fileTimeFormat)+"-123.ndjson.part")
+	if err := os.WriteFile(part, []byte("{}\n{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tap := &Tap{Identity: "api", Directory: dir, Mode: "strict"}
+	provision(t, tap)
+	err = tap.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/blocked", nil),
+		caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil }))
+	var httpErr caddyhttp.HandlerError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("got %v, want Caddy HTTP 500", err)
+	}
+	if data, err := os.ReadFile(part); err != nil || string(data) != "{}\n{" {
+		t.Fatalf("locked part contains %q, error %v", data, err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	captureTestPath(t, tap, "/after-lock-release")
+	if got := oneLogFile(t, dir, "*.ndjson.part"); got != part {
+		t.Fatalf("resumed %q, want %q", got, part)
 	}
 }
