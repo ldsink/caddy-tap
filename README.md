@@ -44,17 +44,17 @@ This configuration captures only `/api/*`. Remove `@api` to enable capture for t
 /tmp/caddy-tap run --config Caddyfile --adapter caddyfile
 ```
 
-| Parameter | Default | Behavior |
-| --- | --- | --- |
-| `identity` | Required | 1–64 ASCII letters, digits, underscores, or hyphens. Must start with a letter or digit. Use distinct identities for tap blocks sharing a directory. |
-| `directory` | Required | Output directory. Relative paths resolve against the Caddy process's working directory. New directories have permissions `0700`. |
-| `mode` | `drop` | `drop` discards the entire capture record when capacity runs out. `strict` waits for capacity, disables body truncation, and waits for the log file to sync. |
-| `queue_size` | `64` | Maximum number of exchanges being captured, queued, or written per configured instance, from 1 to 65536. |
-| `max_body_bytes` | `1MiB` | In default mode, the byte limit applies separately to request and response bodies. The log still reports the total observed bytes and flags truncation. Omit this option in strict mode. |
-| `roll_size` | `100MiB` | Rotates before appending a record that would exceed the threshold. A record larger than the threshold gets its own file. |
-| `roll_interval` | Disabled | Rotates on the next write after the specified time has elapsed since the current file was created. Supports durations such as `24h` and `1d`. |
-| `roll_keep` | `10` | Maximum number of closed files to keep for the same directory and identity. Set to `-1` to disable the limit. |
-| `roll_keep_for` | `2160h` | Maximum retention age for closed files, based on the UTC timestamp in the filename. Set to `-1` to disable the limit. |
+| Parameter        | Default  | Behavior                                                                                                                                                                                 |
+| ---------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `identity`       | Required | 1–64 ASCII letters, digits, underscores, or hyphens. Must start with a letter or digit. Use distinct identities for tap blocks sharing a directory.                                      |
+| `directory`      | Required | Output directory. Relative paths resolve against the Caddy process's working directory. New directories have permissions `0700`.                                                         |
+| `mode`           | `drop`   | `drop` discards the entire capture record when capacity runs out. `strict` waits for capacity, disables body truncation, and waits for the log file to sync.                             |
+| `queue_size`     | `64`     | Maximum number of exchanges being captured, queued, or written per configured instance, from 1 to 65536.                                                                                 |
+| `max_body_bytes` | `1MiB`   | In default mode, the byte limit applies separately to request and response bodies. The log still reports the total observed bytes and flags truncation. Omit this option in strict mode. |
+| `roll_size`      | `100MiB` | Rotates before appending a record that would exceed the threshold. A record larger than the threshold gets its own file.                                                                 |
+| `roll_interval`  | Disabled | Rotates on the next write after the specified time has elapsed since the current file was created. Supports durations such as `24h` and `1d`.                                            |
+| `roll_keep`      | `10`     | Maximum number of closed files to keep for the same directory and identity. Set to `-1` to disable the limit.                                                                            |
+| `roll_keep_for`  | `2160h`  | Maximum retention age for closed files, based on the UTC timestamp in the filename. Set to `-1` to disable the limit.                                                                    |
 
 Size settings accept byte counts and units such as `KiB` and `MiB`. Retention runs after the first record is successfully written to a new file and applies all enabled limits. No scheduled deletion runs while idle. Use separate output directories or identities for multiple Caddy processes so each can manage its own retention.
 
