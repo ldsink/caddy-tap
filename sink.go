@@ -41,10 +41,16 @@ type fileSink struct {
 	syncedDir bool
 }
 
-func (s *fileSink) write(now time.Time, record exchange) error {
+func (s *fileSink) write(now time.Time, record exchange, omitFields ...string) error {
 	data, err := encodeExchange(record)
 	if err != nil {
 		return err
+	}
+	if len(omitFields) > 0 {
+		data, err = omitJSONFields(data, omitFields)
+		if err != nil {
+			return fmt.Errorf("omit_fields: %w", err)
+		}
 	}
 	data = append(data, '\n')
 	size := int64(len(data))
@@ -77,6 +83,34 @@ func (s *fileSink) write(now time.Time, record exchange) error {
 		s.reportPrune(now)
 	}
 	return nil
+}
+
+func omitJSONFields(data []byte, paths []string) ([]byte, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil {
+		return nil, err
+	}
+	children := make(map[string][]string)
+	for _, path := range paths {
+		key, rest, nested := strings.Cut(path, ".")
+		if !nested {
+			delete(object, key)
+			continue
+		}
+		children[key] = append(children[key], rest)
+	}
+	for key, paths := range children {
+		value := object[key]
+		if len(value) == 0 || value[0] != '{' {
+			continue
+		}
+		filtered, err := omitJSONFields(value, paths)
+		if err != nil {
+			return nil, err
+		}
+		object[key] = filtered
+	}
+	return json.Marshal(object)
 }
 
 func encodeExchange(record exchange) ([]byte, error) {

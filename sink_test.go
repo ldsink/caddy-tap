@@ -189,9 +189,13 @@ func TestFilePreservesNonUTF8Metadata(t *testing.T) {
 	if err := s.write(record.Timestamp, record); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.write(record.Timestamp, record, "request.header", "request.trailer_base64.X-Raw",
+		"response.header", "response.header_base64", "response.informational"); err != nil {
+		t.Fatal(err)
+	}
 	s.reportClose(record.Timestamp)
 	records, err := readExchanges(dir)
-	if err != nil || len(records) != 1 {
+	if err != nil || len(records) != 2 {
 		t.Fatalf("records %+v, error %v", records, err)
 	}
 	e := records[0]
@@ -208,6 +212,13 @@ func TestFilePreservesNonUTF8Metadata(t *testing.T) {
 			t.Fatalf("original header bytes %v, want %v", original, want)
 		}
 	}
+	filtered := records[1]
+	if filtered.Request.Header != nil || !reflect.DeepEqual(filtered.Request.HeaderBase64, want) ||
+		!reflect.DeepEqual(filtered.Request.Trailer, e.Request.Trailer) || len(filtered.Request.TrailerBase64) != 0 ||
+		filtered.Response.Header != nil || filtered.Response.HeaderBase64 != nil ||
+		!reflect.DeepEqual(filtered.Response.TrailerBase64, want) || filtered.Response.Informational != nil {
+		t.Fatalf("unexpected filtered metadata: %+v", filtered)
+	}
 	if record.Response.Informational[0].HeaderBase64 != nil {
 		t.Fatal("encoding mutated the caller's informational response")
 	}
@@ -223,6 +234,83 @@ func TestInvalidRecordDoesNotCreateFile(t *testing.T) {
 	entries, err := os.ReadDir(dir)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("invalid record created a file: entries %v, error %v", entries, err)
+	}
+}
+
+func TestOmitJSONFields(t *testing.T) {
+	const input = `{"identity":"api","duration_ns":9007199254740993,"request":{"header":{"Auth":["one","two"],"Other":["three"]},"header_base64":{"Auth":["/w=="]},"trailer":null},"response":{"informational":[{"header":{"Auth":["four"]}}],"status":200}}`
+	for _, tc := range []struct {
+		name  string
+		paths []string
+		want  string
+	}{
+		{
+			"whole properties",
+			[]string{"identity", "request.header", "response.informational"},
+			`{"duration_ns":9007199254740993,"request":{"header_base64":{"Auth":["/w=="]},"trailer":null},"response":{"status":200}}`,
+		},
+		{
+			"exact keys and repeated paths",
+			[]string{"request.header.Auth", "request.header.Auth", "request.header_base64.Auth"},
+			`{"duration_ns":9007199254740993,"identity":"api","request":{"header":{"Other":["three"]},"header_base64":{},"trailer":null},"response":{"informational":[{"header":{"Auth":["four"]}}],"status":200}}`,
+		},
+		{
+			"missing and non-object paths",
+			[]string{"Identity", "request.header.auth", "request.missing.key", "request.trailer.Auth", "response.informational.0.header", "response.status.code"},
+			`{"duration_ns":9007199254740993,"identity":"api","request":{"header":{"Auth":["one","two"],"Other":["three"]},"header_base64":{"Auth":["/w=="]},"trailer":null},"response":{"informational":[{"header":{"Auth":["four"]}}],"status":200}}`,
+		},
+		{
+			"overlapping paths",
+			[]string{"request.header.Auth", "request", "request.header_base64"},
+			`{"duration_ns":9007199254740993,"identity":"api","response":{"informational":[{"header":{"Auth":["four"]}}],"status":200}}`,
+		},
+		{
+			"several paths in the same object",
+			[]string{"request.header.Auth", "request.header.Other", "request.header_base64"},
+			`{"duration_ns":9007199254740993,"identity":"api","request":{"header":{},"trailer":null},"response":{"informational":[{"header":{"Auth":["four"]}}],"status":200}}`,
+		},
+		{
+			"all properties",
+			[]string{"identity", "duration_ns", "request", "response"},
+			`{}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := omitJSONFields([]byte(input), tc.paths)
+			if err != nil || string(got) != tc.want {
+				t.Fatalf("got %s, error %v, want %s", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestOmitJSONFieldsMatchesLiteralKeys(t *testing.T) {
+	const input = `{"request":{"header":{"X.Auth":["one"],"Auth":["two"],"X-é":["three"]}},"optional":null}`
+	paths := []string{"request.header.X.Auth", "request.header.*", "request.header.X-é", "optional"}
+	got, err := omitJSONFields([]byte(input), paths)
+	if want := `{"request":{"header":{"Auth":["two"],"X.Auth":["one"]}}}`; err != nil || string(got) != want {
+		t.Fatalf("got %s, error %v, want %s", got, err, want)
+	}
+}
+
+func TestOmitFieldsBeforeSizeRotation(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	s := fileSink{dir: dir, prefix: "api-", sizeLimit: 6, keep: -1, maxAge: -1, logger: zap.NewNop()}
+	t.Cleanup(func() { s.reportClose(now) })
+	paths := []string{"timestamp", "duration_ns", "identity", "request", "response"}
+	for range 2 {
+		if err := s.write(now, exchange{Timestamp: now, Identity: "api"}, paths...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := oneLogFile(t, dir, "*.ndjson.part")
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "{}\n{}\n" || s.written != 6 {
+		t.Fatalf("data=%q written=%d error=%v", data, s.written, err)
+	}
+	if files, err := filepath.Glob(filepath.Join(dir, "*.ndjson")); err != nil || len(files) != 0 {
+		t.Fatalf("unexpected rotation: %v, error %v", files, err)
 	}
 }
 

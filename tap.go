@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,6 +61,7 @@ type Tap struct {
 	RollInterval caddy.Duration `json:"roll_interval,omitempty"`
 	RollKeep     int            `json:"roll_keep,omitempty"`
 	RollKeepFor  caddy.Duration `json:"roll_keep_for,omitempty"`
+	OmitFields   []string       `json:"omit_fields,omitempty"`
 
 	runtime  *tapRuntime
 	released bool // guarded by runtime.mu
@@ -89,8 +91,9 @@ type tapRuntime struct {
 }
 
 type queuedRecord struct {
-	record exchange
-	result chan error
+	record     exchange
+	result     chan error
+	omitFields []string
 }
 
 func (Tap) CaddyModule() caddy.ModuleInfo {
@@ -118,6 +121,13 @@ func (t *Tap) Validate() error {
 		return fmt.Errorf("max_body_bytes cannot be set in strict mode")
 	case t.RollKeep < -1 || t.RollKeepFor < -1:
 		return fmt.Errorf("retention limits must be nonnegative or -1 to disable")
+	}
+	for _, path := range t.OmitFields {
+		for segment := range strings.SplitSeq(path, ".") {
+			if strings.TrimSpace(segment) == "" {
+				return fmt.Errorf("omit_fields: path %q contains an empty segment", path)
+			}
+		}
 	}
 	return nil
 }
@@ -267,7 +277,7 @@ func (rt *tapRuntime) writeRecords(sink *fileSink, lockPath string) {
 			}
 			if err == nil {
 				sink.strict = item.result != nil
-				err = sink.write(time.Now(), item.record)
+				err = sink.write(time.Now(), item.record, item.omitFields...)
 			}
 			if err != nil {
 				rt.logger.Error("could not write HTTP exchange", zap.Error(err))
@@ -356,7 +366,7 @@ func (t *Tap) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.H
 		rt.mu.Unlock()
 	}()
 
-	item := queuedRecord{}
+	item := queuedRecord{omitFields: t.OmitFields}
 	if strict {
 		ctx := r.Context()
 		if len(activeTaps) != 0 {

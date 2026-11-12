@@ -23,6 +23,7 @@ func TestCaddyfileAdapter(t *testing.T) {
 			roll_size 10MiB
 			roll_interval 1d
 			roll_keep -1
+			omit_fields identity request.header request.header_base64
 			roll_keep_for -1
 		}
 		handle /other/* {
@@ -73,7 +74,8 @@ func TestCaddyfileAdapter(t *testing.T) {
 	}
 	if tap.Identity != "main-api" || tap.Directory != "/tmp/tap logs" || tap.Mode != "strict" ||
 		tap.QueueSize != 3 || tap.RollSize != 10<<20 || time.Duration(tap.RollInterval) != 24*time.Hour ||
-		tap.RollKeep != -1 || tap.RollKeepFor != -1 {
+		tap.RollKeep != -1 || tap.RollKeepFor != -1 ||
+		!slices.Equal(tap.OmitFields, []string{"identity", "request.header", "request.header_base64"}) {
 		t.Fatalf("unexpected config %+v", tap)
 	}
 }
@@ -99,6 +101,11 @@ func TestInvalidCaddyfile(t *testing.T) {
 		{"queue_size 0", "positive"},
 		{"queue_size 65537", "65536"},
 		{"mode strict\nmax_body_bytes 1KiB", "strict mode"},
+		{"omit_fields", "wrong argument"},
+		{"omit_fields identity\nomit_fields request.header", "duplicate"},
+		{"omit_fields request..header", "empty segment"},
+		{"omit_fields identity {\nrequest.header\n}", "nested"},
+		{`omit_fields ""`, "empty segment"},
 	} {
 		t.Run(tc.option, func(t *testing.T) {
 			d := caddyfile.NewTestDispenser("tap {\nidentity api\ndirectory /tmp\n" + tc.option + "\n}")
@@ -111,6 +118,34 @@ func TestInvalidCaddyfile(t *testing.T) {
 		if err := cfg.Validate(); err == nil {
 			t.Fatalf("accepted invalid JSON config %+v", cfg)
 		}
+	}
+}
+
+func TestOmitFieldsJSONConfig(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		valid bool
+	}{
+		{`[]`, true},
+		{`["identity", "request.header.User-Agent"]`, true},
+		{`[null]`, false},
+		{`[""]`, false},
+		{`[".identity"]`, false},
+		{`["identity."]`, false},
+		{`["request. .header"]`, false},
+		{`"identity"`, false},
+		{`[42]`, false},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			var cfg Tap
+			err := json.Unmarshal([]byte(`{"identity":"api","directory":"/tmp","omit_fields":`+tc.value+`}`), &cfg)
+			if err == nil {
+				err = cfg.Validate()
+			}
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%t, got %v", tc.valid, err)
+			}
+		})
 	}
 }
 

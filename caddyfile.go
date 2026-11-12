@@ -30,6 +30,10 @@ func (t *Tap) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			return d.ArgErr()
 		}
 		value := d.Val()
+		if option == "omit_fields" {
+			t.OmitFields = append([]string{value}, d.RemainingArgs()...)
+			continue
+		}
 		if d.NextArg() {
 			return d.ArgErr()
 		}

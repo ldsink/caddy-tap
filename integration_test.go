@@ -3,6 +3,7 @@ package tap
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -125,6 +126,7 @@ func TestCaddyBinary(t *testing.T) {
 	addr, admin := localAddress(t), localAddress(t)
 	config := filepath.Join(dir, "Caddyfile")
 	logs := filepath.Join(dir, "logs")
+	filteredLogs := filepath.Join(dir, "filtered")
 	writeConfig := func(mode, limit string) {
 		t.Helper()
 		cfg := fmt.Sprintf(`{
@@ -143,9 +145,21 @@ http://%s {
 		%s
 		roll_size 1KiB
 	}
+	tap /omit/header {
+		identity filtered
+		directory "%s"
+		mode strict
+		omit_fields identity request.header
+	}
+	tap /omit/header-and-base64 {
+		identity filtered
+		directory "%s"
+		mode strict
+		omit_fields identity request.header request.header_base64
+	}
 	reverse_proxy %s
 }
-`, admin, addr, logs, mode, limit, upstream.URL)
+`, admin, addr, logs, mode, limit, filteredLogs, filteredLogs, upstream.URL)
 		if err := os.WriteFile(config, []byte(cfg), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -236,6 +250,8 @@ http://%s {
 	h2Client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Protocols: &protocols}}
 	defer h2Client.CloseIdleConnections()
 	send(h2Client, "HTTP/2.0", "/logged/strict", nil)
+	send(client, "HTTP/1.1", "/omit/header", nil)
+	send(h2Client, "HTTP/2.0", "/omit/header-and-base64", nil)
 
 	upgradeCtx, cancelUpgrade := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelUpgrade()
@@ -309,5 +325,39 @@ http://%s {
 			!bytes.Equal(e.Request.Data, requestBody) || !bytes.Equal(e.Response.Data, responseBody) {
 			t.Fatalf("logged exchange %+v", e)
 		}
+	}
+
+	data, err := os.ReadFile(oneLogFile(t, filteredLogs, "filtered-*.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	for _, path := range []string{"/omit/header", "/omit/header-and-base64"} {
+		var record struct {
+			Identity json.RawMessage
+			Request  struct {
+				URL          string
+				Header       json.RawMessage
+				HeaderBase64 json.RawMessage `json:"header_base64"`
+			}
+		}
+		if err := decoder.Decode(&record); err != nil {
+			t.Fatal(err)
+		}
+		if record.Request.URL != path || record.Identity != nil || record.Request.Header != nil {
+			t.Fatalf("unexpected filtered record for %q: %+v", path, record)
+		}
+		if path == "/omit/header" {
+			var raw map[string][][]byte
+			if err := json.Unmarshal(record.Request.HeaderBase64, &raw); err != nil ||
+				!reflect.DeepEqual(raw["X-Raw"], [][]byte{[]byte(rawHeader)}) {
+				t.Fatalf("request.header_base64 = %s, error %v", record.Request.HeaderBase64, err)
+			}
+		} else if record.Request.HeaderBase64 != nil {
+			t.Fatalf("request.header_base64 was retained: %s", record.Request.HeaderBase64)
+		}
+	}
+	if err := decoder.Decode(new(json.RawMessage)); err != io.EOF {
+		t.Fatalf("expected two filtered records, next decode: %v", err)
 	}
 }

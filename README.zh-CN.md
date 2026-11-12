@@ -32,6 +32,7 @@ xcaddy build v2.11.9 --with github.com/ldsink/caddy-tap --output /tmp/caddy-tap
         roll_interval 24h
         roll_keep 10
         roll_keep_for 720h
+        omit_fields identity request.header request.header_base64
     }
 }
 
@@ -62,6 +63,7 @@ xcaddy build v2.11.9 --with github.com/ldsink/caddy-tap --output /tmp/caddy-tap
         roll_interval 24h
         roll_keep 10
         roll_keep_for 720h
+        omit_fields identity request.header request.header_base64
     }
 
     reverse_proxy localhost:9000
@@ -86,6 +88,7 @@ xcaddy build v2.11.9 --with github.com/ldsink/caddy-tap --output /tmp/caddy-tap
 | `roll_interval`  | 关闭     | 当前文件创建后达到指定时长即封存，即使没有新记录。支持 `24h`、`1d` 等时长。                              |
 | `roll_keep`      | `10`     | 同一目录、同一标识最多保留的已封存文件数。设为 `-1` 关闭该限制。                                         |
 | `roll_keep_for`  | `2160h`  | 以文件名中的 UTC 时间判断已封存文件的最大保留时长。设为 `-1` 关闭该限制。                                |
+| `omit_fields`    | 无       | 从新日志记录中删除指定的 JSON 路径，精确匹配大小写。                                                     |
 
 大小参数支持字节数和 `KiB`、`MiB` 等单位。保留策略在新文件的首条记录成功写入后和文件封存后执行，只处理已封存文件。同一个 UTC 秒内创建的文件，按最后修改时间优先保留较新的文件。
 
@@ -113,7 +116,8 @@ xcaddy build v2.11.9 --with github.com/ldsink/caddy-tap --output /tmp/caddy-tap
   "roll_size": 104857600,
   "roll_interval": "24h",
   "roll_keep": 10,
-  "roll_keep_for": "720h"
+  "roll_keep_for": "720h",
+  "omit_fields": ["identity", "request.header", "request.header_base64"]
 }
 ```
 
@@ -124,7 +128,7 @@ xcaddy build v2.11.9 --with github.com/ldsink/caddy-tap --output /tmp/caddy-tap
 在同一个 Caddy 进程中，解析后的输出目录和 `identity` 相同的 tap 定义共用一个队列、一个写入 worker 和一个当前 `.ndjson.part`。任一路由的流量都会占用共享队列容量，可用 `request.url` 区分记录来源。
 
 - **`queue_size` 或任意 `roll_*` 设置不同。** Caddy 拒绝加载配置。如果热重载失败，旧配置会继续运行。修改正在运行的组的这些设置需要重启 Caddy。
-- **`mode` 或 `max_body_bytes` 不同。** 各路由使用自己的采集设置，仍共用写入 worker。如果同一个 HTTP 请求进入同组的多个 tap handler，只由最外层实际开始采集的 handler 按自己的设置记录一次。
+- **`mode`、`max_body_bytes` 或 `omit_fields` 不同。** 各路由使用自己的采集设置，仍共用写入 worker。如果同一个 HTTP 请求进入同组的多个 tap handler，只由最外层实际开始采集的 handler 按自己的设置记录一次。
 - **解析后的输出目录不同。** 即使 `identity` 相同，各目录也有独立的队列、写入 worker 和文件。
 
 写入中的文件形如 `api-20261111T120000-123456789.ndjson.part`，在 Unix 上权限为 `0600`。Windows 上的访问权限由输出目录的 ACL 决定。按大小或时间滚动，以及优雅关闭时，先同步并关闭文件，再在同一目录内将其改名为 `api-20261111T120000-123456789.ndjson`。同步、关闭文件或改名失败时会保留 part，等待恢复。
@@ -133,9 +137,17 @@ xcaddy build v2.11.9 --with github.com/ldsink/caddy-tap --output /tmp/caddy-tap
 
 上传进程只需处理已封存的 `*.ndjson` 文件。若从直接写入 `.ndjson` 的旧版本升级，请先停止旧进程再启动上传监听。启动时扫描一次，并定期补扫，以覆盖目录监听漏掉的事件。若每个文件都必须保留到上传成功，请将 `roll_keep` 和 `roll_keep_for` 都设为 `-1`，由上传进程在成功后删除本地文件。
 
+### 删除日志字段
+
+例如，`omit_fields identity request.header` 会删除顶层的 `identity` 属性和整个 `request.header` 对象。配置中的 `identity` 仍用于确定日志文件名和写入组。过滤在写入每条新记录前执行，HTTP 流量和已有日志记录保持原样。
+
+用点号分隔对象层级，按键名精确匹配大小写。例如，`request.header.User-Agent` 会删除该键的所有值。路径不存在时跳过，路径中有空段或纯空白段时配置无效。路径可以删除整个对象或数组。路径无法进入数组内部，也无法定位名称本身含点号的键。
+
+每条路径只影响指定的属性。如需同时删除请求头及其原始字节副本，请同时列出 `request.header` 和 `request.header_base64`。
+
 ### 日志格式与捕获边界
 
-- 每行包含 `identity`、`timestamp`、`duration_ns`、`request` 和 `response`。请求字段包含 `method`、`url`、`request_uri`、`host`、`scheme`、`protocol`、`remote_addr`、`content_length` 和可用的 `transfer_encoding`。相对形式的 URL 可结合 `scheme` 和 `host` 使用。请求和响应的 `header`、`trailer` 以字符串数组保留重复值。响应另有 `status` 和可用的 `informational`、`hijacked`。
+- 默认每行包含 `identity`、`timestamp`、`duration_ns`、`request` 和 `response`。请求字段包含 `method`、`url`、`request_uri`、`host`、`scheme`、`protocol`、`remote_addr`、`content_length` 和可用的 `transfer_encoding`。相对形式的 URL 可结合 `scheme` 和 `host` 使用。请求和响应的 `header`、`trailer` 以字符串数组保留重复值。响应另有 `status` 和可用的 `informational`、`hijacked`。
 - 当 header 或 trailer 的某个值包含非 UTF-8 字节时，`header_base64` 或 `trailer_base64` 保存对应名称下的全部原始值，顺序和文本字段一致。对于非 UTF-8 的 URL 或请求目标，使用 `url_base64` 或 `request_uri_base64` 还原原始字节。
 - `body_base64` 可还原捕获到的字节，无字节时为 `null`。`body_bytes` 是中间件观察到的总字节数，`body_truncated` 表示观察到的数据超过采集上限。请求的 `body_complete` 表示观察到 EOF 或已读取完整的已知长度。I/O 错误记为 `body_error`，下游返回的错误记为 `error`，下游 panic 时记录 `aborted: true` 并让 Caddy 继续处理。
 - 捕获发生在 Caddy handler 边界。请求体只复制下游实际读取的字节。响应体复制写入器接受的字节，服务器后来补充的 header、链路外生成的响应和连接升级后直接写入连接的数据超出捕获范围。 `status: 0` 表示未观察到最终状态的提交，可能包括空 handler、Caddy 外层错误处理或直接写入升级握手的场景。

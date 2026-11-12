@@ -32,6 +32,7 @@ We recommend defining each shared tap configuration once in a [Caddyfile snippet
         roll_interval 24h
         roll_keep 10
         roll_keep_for 720h
+        omit_fields identity request.header request.header_base64
     }
 }
 
@@ -62,6 +63,7 @@ For a single entry point, you can put the settings directly in a `tap` block. Th
         roll_interval 24h
         roll_keep 10
         roll_keep_for 720h
+        omit_fields identity request.header request.header_base64
     }
 
     reverse_proxy localhost:9000
@@ -86,6 +88,7 @@ Use either example as your Caddyfile, then validate and run it.
 | `roll_interval`  | Disabled | Seals the current file when the specified time has elapsed since it was created, even without another write. Supports durations such as `24h` and `1d`.                                  |
 | `roll_keep`      | `10`     | Maximum number of sealed files to keep for the same directory and identity. Set to `-1` to disable the limit.                                                                            |
 | `roll_keep_for`  | `2160h`  | Maximum retention age for sealed files, based on the UTC timestamp in the filename. Set to `-1` to disable the limit.                                                                    |
+| `omit_fields`    | None     | Exact, case-sensitive JSON paths to omit from new log records.                                                                                                                           |
 
 Size settings accept byte counts and units such as `KiB` and `MiB`. Retention runs after the first successful write to a new file and after a file is sealed. It only considers sealed files. For files created in the same UTC second, the count limit keeps the most recently modified files first.
 
@@ -113,7 +116,8 @@ In JSON, zero uses the default for `queue_size`, `max_body_bytes`, `roll_size`, 
   "roll_size": 104857600,
   "roll_interval": "24h",
   "roll_keep": 10,
-  "roll_keep_for": "720h"
+  "roll_keep_for": "720h",
+  "omit_fields": ["identity", "request.header", "request.header_base64"]
 }
 ```
 
@@ -124,7 +128,7 @@ In JSON, zero uses the default for `queue_size`, `max_body_bytes`, `roll_size`, 
 Within one Caddy process, tap definitions with the same resolved output directory and `identity` share one queue, writer, and current `.ndjson.part`. Traffic on either route consumes capacity from that queue. Use `request.url` to tell the records apart.
 
 - **Different `queue_size` or `roll_*` settings.** Caddy rejects the configuration. On a failed reload, the previous configuration keeps running. Restart Caddy to change these settings for a live group.
-- **Different `mode` or `max_body_bytes`.** Each route uses its own capture settings and shares the same writer. If the same HTTP request enters multiple tap handlers in that group, only the outermost handler that starts capture records it, using its own settings.
+- **Different `mode`, `max_body_bytes`, or `omit_fields`.** Each route uses its own capture settings and shares the same writer. If the same HTTP request enters multiple tap handlers in that group, only the outermost handler that starts capture records it, using its own settings.
 - **Different resolved output directories.** Each directory has its own queue, writer, and files, even with the same `identity`.
 
 The writer creates files such as `api-20261111T120000-123456789.ndjson.part` with permissions `0600` on Unix. On Windows, access depends on the output directory’s ACL. After a size or time rotation or graceful shutdown, it syncs and closes the file before renaming it in the same directory to `api-20261111T120000-123456789.ndjson`. A failure to sync or close the file, or to rename it, leaves the part for recovery.
@@ -133,9 +137,17 @@ On the first captured record after startup, the writer locks the group and check
 
 Upload only finalized `*.ndjson` files. When upgrading from a version that wrote directly to `.ndjson`, stop the old process before enabling the uploader. Scan on startup and periodically to catch files missed by the directory watcher. If the uploader must keep every file until upload succeeds, set both `roll_keep` and `roll_keep_for` to `-1` and let the uploader delete the local file after success.
 
+### Omitting fields from log records
+
+For example, `omit_fields identity request.header` removes the top-level `identity` property and the whole `request.header` object. The configured identity still determines the log file name and writer group. Filtering applies before writing each new record and leaves HTTP traffic and existing log records untouched.
+
+Use dots to separate object keys and match their exact case. For example, `request.header.User-Agent` removes every value under that key. Missing paths are skipped, and empty or whitespace-only path segments are invalid. A path can remove an entire object or array. Paths cannot traverse arrays or address a key containing a literal dot.
+
+Each path applies only to the specified property. To remove request headers and their raw-byte copies, list both `request.header` and `request.header_base64`.
+
 ### Log format and capture boundaries
 
-- Each line contains `identity`, `timestamp`, `duration_ns`, `request`, and `response`. Request fields include `method`, `url`, `request_uri`, `host`, `scheme`, `protocol`, `remote_addr`, `content_length`, and `transfer_encoding` when available. Use `scheme` and `host` with a relative URL. Request and response `header` and `trailer` fields preserve repeated values in string arrays. The response also includes `status`, with `informational` and `hijacked` when available.
+- By default, each line contains `identity`, `timestamp`, `duration_ns`, `request`, and `response`. Request fields include `method`, `url`, `request_uri`, `host`, `scheme`, `protocol`, `remote_addr`, `content_length`, and `transfer_encoding` when available. Use `scheme` and `host` with a relative URL. Request and response `header` and `trailer` fields preserve repeated values in string arrays. The response also includes `status`, with `informational` and `hijacked` when available.
 - When a header or trailer value contains non-UTF-8 bytes, `header_base64` or `trailer_base64` stores every raw value for that name in the same order as the text field. Use `url_base64` or `request_uri_base64` to recover the original bytes of a non-UTF-8 URL or request target.
 - Decode `body_base64` to recover the captured bytes. The field is `null` when no bytes were captured. `body_bytes` is the total number of bytes observed by the middleware, and `body_truncated` indicates that observed data exceeded the capture limit. For requests, `body_complete` indicates that tap observed EOF or that the full known length was read. Tap records I/O errors in `body_error` and errors returned by downstream handlers in `error`. If a downstream handler panics, tap records `aborted: true` and lets Caddy handle the panic.
 - Capture happens at the Caddy handler boundary. Tap copies only the request body bytes that downstream handlers read and the response body bytes that the writer accepts. Headers added later by the server, responses generated outside the handler chain, and bytes written directly to an upgraded connection are outside this boundary. `status: 0` means tap observed no final status being committed. This can happen with an empty handler, Caddy's outer error handling, or an upgrade handshake written directly to the connection.

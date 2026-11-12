@@ -101,6 +101,58 @@ func TestDropModeCapacityAndCleanup(t *testing.T) {
 	}
 }
 
+func TestOmitFieldsAffectsOnlyPersistedLog(t *testing.T) {
+	for _, mode := range []string{"drop", "strict"} {
+		t.Run(mode, func(t *testing.T) {
+			var tap Tap
+			if err := json.Unmarshal([]byte(`{"identity":"api","omit_fields":["identity","request.header","response.header.Set-Cookie","response.body_base64"]}`), &tap); err != nil {
+				t.Fatal(err)
+			}
+			tap.Directory, tap.Mode = t.TempDir(), mode
+			provision(t, &tap)
+			r := httptest.NewRequest(http.MethodGet, "/capture", nil)
+			r.Header.Set("Authorization", "Bearer fixture")
+			w := httptest.NewRecorder()
+			err := tap.ServeHTTP(w, r, caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				if got := r.Header.Get("Authorization"); got != "Bearer fixture" {
+					t.Errorf("downstream authorization = %q", got)
+				}
+				w.Header().Add("Set-Cookie", "first=1")
+				w.Header().Add("Set-Cookie", "second=2")
+				w.Header().Set("X-Keep", "visible")
+				_, err := io.WriteString(w, "response")
+				return err
+			}))
+			if err != nil || w.Code != http.StatusOK || w.Body.String() != "response" ||
+				strings.Join(w.Result().Header.Values("Set-Cookie"), ",") != "first=1,second=2" {
+				t.Fatalf("response status %d, headers %v, body %q, error %v", w.Code, w.Header(), w.Body, err)
+			}
+			if err := tap.Cleanup(); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(oneLogFile(t, tap.Directory, "api-*.ndjson"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var record map[string]json.RawMessage
+			if err := json.Unmarshal(data, &record); err != nil {
+				t.Fatal(err)
+			}
+			var request, response map[string]json.RawMessage
+			if err := json.Unmarshal(record["request"], &request); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(record["response"], &response); err != nil {
+				t.Fatal(err)
+			}
+			if record["identity"] != nil || request["header"] != nil || response["body_base64"] != nil ||
+				string(response["header"]) != `{"X-Keep":["visible"]}` || string(response["body_bytes"]) != "8" {
+				t.Fatalf("unexpected log record: %s", data)
+			}
+		})
+	}
+}
+
 func TestStrictModeWaitsForPersistence(t *testing.T) {
 	tap := &Tap{Identity: "api", Mode: "strict", runtime: &tapRuntime{
 		slots: make(chan struct{}, 1), queue: make(chan queuedRecord, 1), logger: zap.NewNop(),
@@ -152,7 +204,7 @@ func TestStrictPersistenceFailureBeforeCommit(t *testing.T) {
 
 func TestConcurrentPathsShareWriter(t *testing.T) {
 	dir := t.TempDir()
-	first := &Tap{Identity: "api", Directory: dir, Mode: "strict", QueueSize: 4}
+	first := &Tap{Identity: "api", Directory: dir, Mode: "strict", QueueSize: 4, OmitFields: []string{"identity", "request.header"}}
 	second := &Tap{Identity: "api", Directory: dir, Mode: "strict", QueueSize: 4}
 	provision(t, first)
 	provision(t, second)
@@ -184,6 +236,16 @@ func TestConcurrentPathsShareWriter(t *testing.T) {
 	for _, record := range records {
 		if string(record.Response.Data) != "done" {
 			t.Fatalf("incomplete record: %+v", record)
+		}
+		switch record.Request.URL {
+		case "/first":
+			if record.Identity != "" || record.Request.Header != nil {
+				t.Fatalf("fields were retained: %+v", record)
+			}
+		case "/second":
+			if record.Identity != "api" || record.Request.Header == nil {
+				t.Fatalf("fields were omitted: %+v", record)
+			}
 		}
 		counts[record.Request.URL]++
 	}
@@ -396,7 +458,7 @@ func TestStrictPersistenceFailurePreservesCommittedResponse(t *testing.T) {
 func TestRecoveryAfterProcessExit(t *testing.T) {
 	const childDir = "CADDY_TAP_TEST_CRASH_DIR"
 	if dir := os.Getenv(childDir); dir != "" {
-		tap := &Tap{Identity: "api", Directory: dir, Mode: "strict"}
+		tap := &Tap{Identity: "api", Directory: dir, Mode: "strict", OmitFields: []string{"identity"}}
 		provision(t, tap)
 		captureTestPath(t, tap, "/before-restart")
 		path := oneLogFile(t, dir, "*.ndjson.part")
@@ -452,7 +514,8 @@ func TestRecoveryAfterProcessExit(t *testing.T) {
 	_ = second.Cleanup()
 	oneLogFile(t, dir, "*.ndjson")
 	records, err := readExchanges(dir)
-	if err != nil || len(records) != 3 || records[0].Request.URL != "/before-restart" {
+	if err != nil || len(records) != 3 || records[0].Request.URL != "/before-restart" ||
+		records[0].Identity != "" || records[1].Identity != "api" || records[2].Identity != "api" {
 		t.Fatalf("recovered records %+v, error %v", records, err)
 	}
 	urls := map[string]bool{}
