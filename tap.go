@@ -145,7 +145,7 @@ func (t *Tap) Provision(ctx caddy.Context) error {
 		logger:     logger,
 	}
 	sink := fileSink{
-		dir: dir, prefix: "tap-" + t.Identity + "--",
+		dir: dir, prefix: t.Identity + "-",
 		sizeLimit: t.RollSize, interval: time.Duration(t.RollInterval),
 		keep: t.RollKeep, maxAge: time.Duration(t.RollKeepFor),
 		strict: t.Mode == "strict", logger: logger,

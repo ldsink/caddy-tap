@@ -78,7 +78,7 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
 
 ## 日志格式与捕获边界
 
-- 文件名形如 `tap-api--20261111T120000.000000000Z-123456789.ndjson`，包含标识、UTC 时间和避免冲突的数字后缀。新建文件权限为 `0600`。
+- 文件名形如 `api-20261111T120000-123456789.ndjson`，包含标识、精确到秒的 UTC 时间和避免冲突的数字后缀。保留策略适用于采用此格式的文件。新建文件权限为 `0600`。
 - 每行包含 `identity`、`timestamp`、`duration_ns`、`request` 和 `response`。请求字段包含 `method`、`url`、`request_uri`、`host`、`scheme`、`protocol`、`remote_addr`、`content_length` 和可用的 `transfer_encoding`。相对形式的 URL 可结合 `scheme` 和 `host` 使用。请求和响应的 `header`、`trailer` 以字符串数组保留重复值。响应另有 `status` 和可用的 `informational`、`hijacked`。
 - 当 header 或 trailer 的某个值包含非 UTF-8 字节时，`header_base64` 或 `trailer_base64` 保存对应名称下的全部原始值，顺序和文本字段一致。对于非 UTF-8 的 URL 或请求目标，使用 `url_base64` 或 `request_uri_base64` 还原原始字节。
 - `body_base64` 可还原捕获到的字节，无字节时为 `null`。`body_bytes` 是中间件观察到的总字节数，`body_truncated` 表示达到采集上限。请求的 `body_complete` 表示观察到 EOF 或已读取完整的已知长度。I/O 错误记为 `body_error`，下游返回的错误记为 `error`，下游 panic 时记录 `aborted: true` 并让 Caddy 继续处理。

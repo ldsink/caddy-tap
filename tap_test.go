@@ -36,7 +36,7 @@ func provision(t *testing.T, tap *Tap) {
 }
 
 func readExchanges(dir string) ([]exchange, error) {
-	paths, err := filepath.Glob(filepath.Join(dir, "tap-*.ndjson"))
+	paths, err := filepath.Glob(filepath.Join(dir, "*.ndjson"))
 	if err != nil {
 		return nil, err
 	}

@@ -15,7 +15,7 @@ import (
 	"go.uber.org/zap"
 )
 
-const fileTimeFormat = "20060102T150405.000000000Z"
+const fileTimeFormat = "20060102T150405"
 
 // Config reloads can briefly leave two workers writing for the same identity.
 var activeFiles = struct {
@@ -162,7 +162,7 @@ func (s *fileSink) reportClose() {
 	}
 }
 
-// prune runs while holding activeFiles and relies on ReadDir's filename order.
+// prune runs while holding activeFiles. Within the same second, the numeric suffix breaks ties by filename order.
 func (s *fileSink) prune(now time.Time) error {
 	if s.keep < 0 && s.maxAge < 0 {
 		return nil
@@ -192,7 +192,7 @@ func (s *fileSink) prune(now time.Time) error {
 		if activeFiles.paths[path] {
 			continue
 		}
-		if (s.maxAge > 0 && now.Sub(stamp) > s.maxAge) || (s.keep >= 0 && kept >= s.keep) {
+		if (s.maxAge > 0 && now.Truncate(time.Second).Sub(stamp) > s.maxAge) || (s.keep >= 0 && kept >= s.keep) {
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				removeErr = errors.Join(removeErr, err)
 			}

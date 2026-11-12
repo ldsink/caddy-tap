@@ -268,7 +268,7 @@ http://%s {
 		t.Fatal(err)
 	}
 
-	paths, err := filepath.Glob(filepath.Join(logs, "tap-binary--*.ndjson"))
+	paths, err := filepath.Glob(filepath.Join(logs, "binary-*.ndjson"))
 	if err != nil || len(paths) != 3 {
 		t.Fatalf("got files %v, error %v", paths, err)
 	}
