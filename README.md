@@ -103,6 +103,8 @@ A nested strict tap in another writer group returns HTTP 503 when its capture sl
 
 Place this object in the HTTP route's `handle` array before the handler you want to observe. Configure path matchers in the route's `match` field. JSON sizes are integer byte counts. Durations can be strings or integer nanosecond counts. To disable `roll_keep_for`, use the number `-1` in JSON or `roll_keep_for -1` in a Caddyfile.
 
+In JSON, zero uses the default for `queue_size`, `max_body_bytes`, `roll_size`, `roll_keep`, and `roll_keep_for`. A zero `roll_interval` disables time-based rotation. In a Caddyfile, omit `queue_size`, `max_body_bytes`, and `roll_size` to use their defaults. An explicit zero for those three options is invalid.
+
 ```json
 {
   "handler": "tap",

@@ -52,10 +52,12 @@ func TestCaddyBinary(t *testing.T) {
 		t.Fatal("Caddy binary does not contain http.handlers.tap")
 	}
 	readmeConfig := filepath.Join(dir, "readme.Caddyfile")
-	if err := os.WriteFile(readmeConfig, []byte(readmeExample(t, "README.md", "caddyfile")), 0600); err != nil {
-		t.Fatal(err)
+	for _, example := range readmeExamples(t, "README.md", "caddyfile") {
+		if err := os.WriteFile(readmeConfig, []byte(example), 0600); err != nil {
+			t.Fatal(err)
+		}
+		run("adapt", "--config", readmeConfig, "--adapter", "caddyfile")
 	}
-	run("adapt", "--config", readmeConfig, "--adapter", "caddyfile")
 
 	requestPayload := []byte{0, 0xff, 'x', 'y', 'z'}
 	firstChunk, lastChunk := []byte(": heartbeat\n\nid: 1\ndata: 你好\n\n"), []byte("id: 2\nevent: update\ndata: stream-end\n\n")

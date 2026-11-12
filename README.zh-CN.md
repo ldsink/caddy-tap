@@ -103,6 +103,8 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
 
 将该对象放入 HTTP 路由的 `handle` 数组，置于需要观察的 handler 前。路径匹配器属于该路由的 `match` 字段。JSON 大小参数为字节整数，时长可用字符串或纳秒整数。JSON 中使用数字 `-1` 关闭 `roll_keep_for`，在 Caddyfile 中使用 `roll_keep_for -1`。
 
+在 JSON 中，`queue_size`、`max_body_bytes`、`roll_size`、`roll_keep` 和 `roll_keep_for` 为零时使用默认值。`roll_interval` 为零时关闭按时间滚动。在 Caddyfile 中，省略 `queue_size`、`max_body_bytes` 和 `roll_size` 即可使用默认值，这三项不能显式设为零。
+
 ```json
 {
   "handler": "tap",

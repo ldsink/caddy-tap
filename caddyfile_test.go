@@ -3,6 +3,7 @@ package tap
 import (
 	"encoding/json"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -109,43 +110,54 @@ func TestInvalidCaddyfile(t *testing.T) {
 	}
 }
 
-func readmeExample(t *testing.T, filename, language string) string {
+func readmeExamples(t *testing.T, filename, language string) []string {
 	t.Helper()
 	content, err := os.ReadFile(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, rest, ok := strings.Cut(string(content), "```"+language+"\n")
-	if !ok {
+	var examples []string
+	rest := string(content)
+	for {
+		_, code, found := strings.Cut(rest, "```"+language+"\n")
+		if !found {
+			break
+		}
+		example, tail, closed := strings.Cut(code, "\n```")
+		if !closed {
+			t.Fatalf("%s %s example has no closing fence", filename, language)
+		}
+		examples = append(examples, example)
+		rest = tail
+	}
+	if len(examples) == 0 {
 		t.Fatalf("%s has no %s example", filename, language)
 	}
-	example, _, ok := strings.Cut(rest, "\n```")
-	if !ok {
-		t.Fatalf("%s %s example has no closing fence", filename, language)
-	}
-	return example
+	return examples
 }
 
 func TestReadmeJSONExample(t *testing.T) {
-	var cfg struct {
-		Handler string `json:"handler"`
-		Tap
-	}
-	d := json.NewDecoder(strings.NewReader(readmeExample(t, "README.md", "json")))
-	d.DisallowUnknownFields()
-	if err := d.Decode(&cfg); err != nil {
-		t.Fatalf("README JSON: %v", err)
-	}
-	if err := cfg.Tap.Validate(); err != nil || cfg.Handler != "tap" {
-		t.Fatalf("README handler %q, config error %v", cfg.Handler, err)
+	for _, example := range readmeExamples(t, "README.md", "json") {
+		var cfg struct {
+			Handler string `json:"handler"`
+			Tap
+		}
+		d := json.NewDecoder(strings.NewReader(example))
+		d.DisallowUnknownFields()
+		if err := d.Decode(&cfg); err != nil {
+			t.Fatalf("README JSON: %v", err)
+		}
+		if err := cfg.Tap.Validate(); err != nil || cfg.Handler != "tap" {
+			t.Fatalf("README handler %q, config error %v", cfg.Handler, err)
+		}
 	}
 }
 
 func TestReadmeExamplesAgree(t *testing.T) {
 	for _, language := range []string{"caddyfile", "json"} {
-		english := readmeExample(t, "README.md", language)
-		chinese := readmeExample(t, "README.zh-CN.md", language)
-		if english != chinese {
+		english := readmeExamples(t, "README.md", language)
+		chinese := readmeExamples(t, "README.zh-CN.md", language)
+		if !slices.Equal(english, chinese) {
 			t.Errorf("README %s examples differ", language)
 		}
 	}
