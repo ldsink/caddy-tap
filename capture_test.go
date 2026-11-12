@@ -1,9 +1,11 @@
 package tap
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -151,6 +153,75 @@ func TestCaptureAbortPropagates(t *testing.T) {
 		_, _ = io.WriteString(w, "partial")
 		panic(http.ErrAbortHandler)
 	}), 0, "test", func(record exchange) { e = record })
+}
+
+func TestCaptureRejectedStatusDoesNotCommit(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	e, err := recordExchange(t, recorder, httptest.NewRequest("GET", "/", nil), 0,
+		func(w http.ResponseWriter, _ *http.Request) error {
+			func() {
+				defer func() {
+					if recover() == nil {
+						t.Error("invalid status did not panic")
+					}
+				}()
+				w.WriteHeader(99)
+			}()
+			w.WriteHeader(http.StatusNoContent)
+			return nil
+		})
+	if err != nil || recorder.Code != http.StatusNoContent || e.Response.Status != recorder.Code {
+		t.Fatalf("recorded status %d, response status %d, error %v", e.Response.Status, recorder.Code, err)
+	}
+}
+
+type hijackedWriter struct {
+	*httptest.ResponseRecorder
+	hijacked bool
+}
+
+func (w *hijackedWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	w.hijacked = true
+	conn, peer := net.Pipe()
+	_ = peer.Close()
+	return conn, bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)), nil
+}
+
+func (w *hijackedWriter) WriteHeader(code int) {
+	if !w.hijacked {
+		w.ResponseRecorder.WriteHeader(code)
+	}
+}
+
+func (w *hijackedWriter) Write(p []byte) (int, error) {
+	if w.hijacked {
+		return 0, http.ErrHijacked
+	}
+	return w.ResponseRecorder.Write(p)
+}
+
+func TestCaptureWritesAfterHijackDoNotCommit(t *testing.T) {
+	for _, status := range []int{0, http.StatusSwitchingProtocols} {
+		underlying := &hijackedWriter{ResponseRecorder: httptest.NewRecorder()}
+		e, err := recordExchange(t, underlying, httptest.NewRequest("GET", "/", nil), 0,
+			func(w http.ResponseWriter, _ *http.Request) error {
+				if status != 0 {
+					w.WriteHeader(status)
+				}
+				conn, _, err := http.NewResponseController(w).Hijack()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Close()
+				w.WriteHeader(http.StatusOK)
+				_, err = w.Write([]byte("late"))
+				return err
+			})
+		if !errors.Is(err, http.ErrHijacked) || !e.Response.Hijacked || e.Response.Status != status ||
+			e.Response.Bytes != 0 || e.Response.bodyRecord.Error != http.ErrHijacked.Error() {
+			t.Fatalf("recorded response %+v, error %v", e.Response, err)
+		}
+	}
 }
 
 type closeErrorBody struct{ io.Reader }

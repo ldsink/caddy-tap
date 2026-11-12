@@ -182,19 +182,21 @@ type responseWriter struct {
 }
 
 func (w *responseWriter) WriteHeader(status int) {
-	if w.record.Status == 0 {
-		head := responseHead{Status: status, Header: snapshotResponseHeader(w.Header())}
-		if status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
-			w.record.Informational = append(w.record.Informational, head)
-		} else {
-			w.record.responseHead = head
-		}
+	if w.record.Status != 0 || w.record.Hijacked {
+		w.ResponseWriter.WriteHeader(status)
+		return
 	}
+	head := responseHead{Status: status, Header: snapshotResponseHeader(w.Header())}
 	w.ResponseWriter.WriteHeader(status)
+	if status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
+		w.record.Informational = append(w.record.Informational, head)
+	} else {
+		w.record.responseHead = head
+	}
 }
 
 func (w *responseWriter) Write(p []byte) (int, error) {
-	if w.record.Status == 0 {
+	if w.record.Status == 0 && !w.record.Hijacked {
 		w.record.responseHead = responseHead{Status: http.StatusOK, Header: snapshotResponseHeader(w.Header())}
 	}
 	n, err := w.ResponseWriter.Write(p)
@@ -218,12 +220,13 @@ func (w *responseWriter) Flush() {
 }
 
 func (w *responseWriter) FlushError() error {
+	uncommitted := w.record.Status == 0 && !w.record.Hijacked
 	var header http.Header
-	if w.record.Status == 0 {
+	if uncommitted {
 		header = snapshotResponseHeader(w.Header())
 	}
 	err := http.NewResponseController(w.ResponseWriter).Flush()
-	if w.record.Status == 0 && !errors.Is(err, http.ErrNotSupported) {
+	if uncommitted && !errors.Is(err, http.ErrNotSupported) {
 		w.record.responseHead = responseHead{Status: http.StatusOK, Header: header}
 	}
 	if err != nil && !errors.Is(err, http.ErrNotSupported) {
