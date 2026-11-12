@@ -84,7 +84,9 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
 }
 ```
 
-## 日志文件与上传
+## 日志与捕获
+
+### 日志文件与上传
 
 如果要把 `/api/*` 和 `/webhooks/*` 等不同路由的记录写入同一个文件，在各自的 tap 块中配置相同的 `directory` 和 `identity`。同一个 Caddy 进程按解析后的目录和标识分组，共用一个队列、一个写入 worker 和一个当前 `.ndjson.part`。任一路由的流量都会占用共享队列容量，可用 `request.url` 区分各条记录的来源。这些路由的 `queue_size` 和所有 `roll_*` 设置必须一致，热重载时同时存在的新旧配置也适用。修改正在运行的组的这些设置需要重启。捕获模式和 body 上限按路由配置。同组路由嵌套时，同一请求只在最外层捕获一次。
 
@@ -94,7 +96,7 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
 
 上传进程只需处理已封存的 `*.ndjson` 文件。若从直接写入 `.ndjson` 的旧版本升级，请先停止旧进程再启动上传监听。启动时扫描一次，并定期补扫，以覆盖目录监听漏掉的事件。若每个文件都必须保留到上传成功，请将 `roll_keep` 和 `roll_keep_for` 都设为 `-1`，由上传进程在成功后删除本地文件。
 
-## 日志格式与捕获边界
+### 日志格式与捕获边界
 
 - 每行包含 `identity`、`timestamp`、`duration_ns`、`request` 和 `response`。请求字段包含 `method`、`url`、`request_uri`、`host`、`scheme`、`protocol`、`remote_addr`、`content_length` 和可用的 `transfer_encoding`。相对形式的 URL 可结合 `scheme` 和 `host` 使用。请求和响应的 `header`、`trailer` 以字符串数组保留重复值。响应另有 `status` 和可用的 `informational`、`hijacked`。
 - 当 header 或 trailer 的某个值包含非 UTF-8 字节时，`header_base64` 或 `trailer_base64` 保存对应名称下的全部原始值，顺序和文本字段一致。对于非 UTF-8 的 URL 或请求目标，使用 `url_base64` 或 `request_uri_base64` 还原原始字节。

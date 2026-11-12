@@ -84,7 +84,9 @@ Place this object in the HTTP route's `handle` array before the handler you want
 }
 ```
 
-## Log files and uploads
+## Logging and capture
+
+### Log files and uploads
 
 To write records from separate routes such as `/api/*` and `/webhooks/*` to one file, set the same `directory` and `identity` in both tap blocks. Within one Caddy process, the resolved directory and identity select a shared queue, writer and current `.ndjson.part`. Traffic on either route consumes capacity from that queue. Use `request.url` to tell the records apart. They must agree on `queue_size` and all `roll_*` settings, including while old and new configurations overlap during a reload. Changing these settings for a live group requires a restart. Capture mode and body limits are set per route. Nested routes in the same group capture the request once at the outermost invocation.
 
@@ -94,7 +96,7 @@ On the first captured record after startup, the writer locks the group and check
 
 Upload only finalized `*.ndjson` files. When upgrading from a version that wrote directly to `.ndjson`, stop the old process before enabling the uploader. Scan on startup and periodically to catch files missed by the directory watcher. If the uploader must keep every file until upload succeeds, set both `roll_keep` and `roll_keep_for` to `-1` and let the uploader delete the local file after success.
 
-## Log format and capture boundaries
+### Log format and capture boundaries
 
 - Each line contains `identity`, `timestamp`, `duration_ns`, `request`, and `response`. Request fields include `method`, `url`, `request_uri`, `host`, `scheme`, `protocol`, `remote_addr`, `content_length`, and `transfer_encoding` when available. Use `scheme` and `host` with a relative URL. Request and response `header` and `trailer` fields preserve repeated values in string arrays. The response also includes `status`, with `informational` and `hijacked` when available.
 - When a header or trailer value contains non-UTF-8 bytes, `header_base64` or `trailer_base64` stores every raw value for that name in the same order as the text field. Use `url_base64` or `request_uri_base64` to recover the original bytes of a non-UTF-8 URL or request target.
