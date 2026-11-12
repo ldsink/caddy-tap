@@ -196,10 +196,15 @@ func (w *responseWriter) WriteHeader(status int) {
 }
 
 func (w *responseWriter) Write(p []byte) (int, error) {
-	if w.record.Status == 0 && !w.record.Hijacked {
-		w.record.responseHead = responseHead{Status: http.StatusOK, Header: snapshotResponseHeader(w.Header())}
+	uncommitted := w.record.Status == 0 && !w.record.Hijacked
+	var header http.Header
+	if uncommitted {
+		header = snapshotResponseHeader(w.Header())
 	}
 	n, err := w.ResponseWriter.Write(p)
+	if uncommitted && !errors.Is(err, http.ErrHijacked) {
+		w.record.responseHead = responseHead{Status: http.StatusOK, Header: header}
+	}
 	w.record.bodyRecord.append(p[:n], w.limit)
 	if err != nil {
 		w.record.bodyRecord.Error = err.Error()

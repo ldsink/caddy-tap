@@ -175,6 +175,26 @@ func TestCaptureRejectedStatusDoesNotCommit(t *testing.T) {
 	}
 }
 
+type panicBeforeWrite struct{ *httptest.ResponseRecorder }
+
+func (panicBeforeWrite) Write([]byte) (int, error) { panic(http.ErrAbortHandler) }
+
+func TestCaptureAbortedImplicitWriteDoesNotCommit(t *testing.T) {
+	var e exchange
+	recorder := httptest.NewRecorder()
+	defer func() {
+		if recovered := recover(); recovered != http.ErrAbortHandler || !e.Aborted ||
+			e.Response.Status != 0 || e.Response.Bytes != 0 {
+			t.Fatalf("panic %v, record %+v", recovered, e)
+		}
+	}()
+	_ = capture(panicBeforeWrite{recorder}, httptest.NewRequest("GET", "/", nil),
+		caddyhttp.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) error {
+			_, err := w.Write([]byte("unwritten"))
+			return err
+		}), 0, "test", func(record exchange) { e = record })
+}
+
 type hijackedWriter struct {
 	*httptest.ResponseRecorder
 	hijacked bool
