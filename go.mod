@@ -1,4 +1,4 @@
-module caddy-tap
+module github.com/ldsink/caddy-tap
 
 go 1.26.0
 

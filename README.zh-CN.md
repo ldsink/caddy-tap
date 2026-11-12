@@ -6,15 +6,13 @@
 
 ## 构建
 
-当前版本使用 Go 1.26 和 Caddy v2.11.9。在仓库根目录执行：
+使用 Go 1.26 和 xcaddy 构建 Caddy v2.11.9，并从 GitHub 获取 tap 模块。以下命令可在任意目录执行。
 
 ```sh
 go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
-xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
+xcaddy build v2.11.9 --with github.com/ldsink/caddy-tap --output /tmp/caddy-tap
 /tmp/caddy-tap list-modules | grep -Fx http.handlers.tap
 ```
-
-`caddy-tap` 是本地 Go 模块路径。发布到代码托管平台后，可将它替换为仓库的 Go 模块路径，再通过 `xcaddy --with` 从远程构建。
 
 ## Caddyfile
 

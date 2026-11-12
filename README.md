@@ -6,15 +6,13 @@ English | [简体中文](README.zh-CN.md)
 
 ## Build
 
-This version uses Go 1.26 and Caddy v2.11.9. Run the following from the repository root:
+Use Go 1.26 and xcaddy to build Caddy v2.11.9 with the tap module from GitHub. You can run these commands from any directory.
 
 ```sh
 go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7
-xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
+xcaddy build v2.11.9 --with github.com/ldsink/caddy-tap --output /tmp/caddy-tap
 /tmp/caddy-tap list-modules | grep -Fx http.handlers.tap
 ```
-
-`caddy-tap` is the local Go module path. Once the module is published, use the repository's Go module path with `xcaddy --with` to build from the remote repository.
 
 ## Caddyfile
 
