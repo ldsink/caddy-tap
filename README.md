@@ -58,6 +58,14 @@ This configuration captures only `/api/*`. Remove `@api` to enable capture for t
 
 Size settings accept byte counts and units such as `KiB` and `MiB`. Retention runs after the first successful write to a new file and after a file is sealed. It only considers sealed files.
 
+### Strict mode trade-offs
+
+- **Higher request latency.** When all shared capture slots are occupied, strict requests wait for capture capacity before invoking the next handler. Before the tap handler returns, it waits for the record to be written and synced. Slow disks can delay requests. Streamed response bytes can reach the client before the sync finishes.
+- **Higher memory use.** Strict mode disables the body capture limit and buffers all observed request and response body bytes in memory. Large bodies and long-lived streams can consume substantial memory.
+- **Disk failures can cause HTTP 500.** Tap logs persistence errors and returns HTTP 500 when the response is still uncommitted and the downstream handler returned no error.
+
+Cancellation stops a request waiting for capture capacity. Records already queued continue to be written.
+
 ## JSON configuration
 
 Place this object in the HTTP route's `handle` array before the handler you want to observe. Configure path matchers in the route's `match` field. JSON sizes are integer byte counts. Durations can be strings or integer nanosecond counts. To disable `roll_keep_for`, use the number `-1` in JSON or `roll_keep_for -1` in a Caddyfile.
@@ -78,7 +86,7 @@ Place this object in the HTTP route's `handle` array before the handler you want
 
 ## Log files and uploads
 
-Routes with the same resolved output directory and identity share one queue, writer and current file. They must agree on `queue_size` and all `roll_*` settings, including while old and new configurations overlap during a reload. Changing these settings for a live group requires a restart. Capture mode and body limits are set per route. Nested routes in the same group capture the request once at the outermost invocation.
+To write records from separate routes such as `/api/*` and `/webhooks/*` to one file, set the same `directory` and `identity` in both tap blocks. Within one Caddy process, the resolved directory and identity select a shared queue, writer and current `.ndjson.part`. Traffic on either route consumes capacity from that queue. Use `request.url` to tell the records apart. They must agree on `queue_size` and all `roll_*` settings, including while old and new configurations overlap during a reload. Changing these settings for a live group requires a restart. Capture mode and body limits are set per route. Nested routes in the same group capture the request once at the outermost invocation.
 
 The writer creates files such as `api-20261111T120000-123456789.ndjson.part` with permissions `0600`. After a size or time rotation or graceful shutdown, it syncs and closes the file before renaming it in the same directory to `api-20261111T120000-123456789.ndjson`. Failed finalization leaves the part for recovery.
 
@@ -93,7 +101,6 @@ Upload only finalized `*.ndjson` files. When upgrading from a version that wrote
 - Decode `body_base64` to recover the captured bytes. The field is `null` when no bytes were captured. `body_bytes` is the total number of bytes observed by the middleware, and `body_truncated` flags truncation at the capture limit. For requests, `body_complete` indicates that tap observed EOF or that the full known length was read. Tap records I/O errors in `body_error` and errors returned by downstream handlers in `error`. If a downstream handler panics, tap records `aborted: true` and lets Caddy handle the panic.
 - Capture happens at the Caddy handler boundary. Tap copies only the request body bytes that downstream handlers read and the response body bytes that the writer accepts. Headers added later by the server, responses generated outside the handler chain, and bytes written directly to an upgraded connection are outside this boundary. `status: 0` means tap observed no final status being committed. This can happen with an empty handler, Caddy's outer error handling, or an upgrade handshake written directly to the connection.
 - In default mode, tap aggregates counts of records dropped due to capacity and reports write errors in the background. During a hot reload, the old configuration continues recording exchanges it has already started capturing. Graceful shutdown drains queued records. In-flight requests that exceed Caddy's shutdown grace period and records still pending on forced termination may be lost.
-- In strict mode, tap holds captured data in memory and waits for the file to sync before the handler returns. A request canceled while waiting for capture capacity stops waiting. Queued records are still written. Response bytes streamed to the client may arrive before the sync completes. Tap reports disk write failures in the Caddy log and returns HTTP 500 if the response is still uncommitted and the downstream handler returned no error. Large bodies increase memory use, and slow disks increase request latency.
 
 Logs store credentials, cookies, query parameters, and bodies as received. Use a directory accessible only to Caddy and authorized readers.
 
@@ -101,7 +108,7 @@ Logs store credentials, cookies, query parameters, and bodies as received. Use a
 
 For responses with `Content-Type: text/event-stream`, tap forwards events and passes flush calls through. It writes one record per captured SSE request when the handler returns. Decode `response.body_base64` to recover the captured SSE bytes, including heartbeat comments, line breaks, event separators, and multiline data. If the handler returns after a client disconnects, the record preserves the bytes the writer accepted before then.
 
-In default mode, a stream that exceeds `max_body_bytes` is truncated in the log while the client can continue receiving events. Strict mode retains all observable bytes in memory until the stream ends. A connection that stays open occupies a capture slot and produces no per-event records.
+In default mode, a stream that exceeds `max_body_bytes` is truncated in the log while the client can continue receiving events. **Strict mode retains all observable bytes in memory until the stream ends.** A connection that stays open occupies a capture slot and produces no per-event records.
 
 ## Tests
 
