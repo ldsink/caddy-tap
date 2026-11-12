@@ -18,12 +18,11 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
 
 ## Caddyfile
 
-以下配置只记录 `/api/*`。去掉 `@api` 即可在站点级启用。也可在 `handle` 块内使用，或在 `route` 块内按书写顺序将它放在 `reverse_proxy` 等响应处理器前。
+推荐把共用的 tap 配置集中写在一个 [Caddyfile 片段（snippet）](https://caddyserver.com/docs/caddyfile/directives/import) 中，再在需要采集的入口用 `import` 引用。以下示例使用同一套设置采集 `/api/*` 和 `/webhooks/*`，每次引用只传入请求匹配器。
 
 ```caddyfile
-:8080 {
-    @api path /api/*
-    tap @api {
+(capture_api) {
+    tap {args[0]} {
         identity api
         directory /var/log/caddy/tap
         mode drop
@@ -34,6 +33,13 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
         roll_keep 10
         roll_keep_for 720h
     }
+}
+
+:8080 {
+    @api path /api/*
+    @webhooks path /webhooks/*
+    import capture_api @api
+    import capture_api @webhooks
 
     reverse_proxy localhost:9000
 }
@@ -88,7 +94,11 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
 
 ### 日志文件与上传
 
-如果要把 `/api/*` 和 `/webhooks/*` 等不同路由的记录写入同一个文件，在各自的 tap 块中配置相同的 `directory` 和 `identity`。同一个 Caddy 进程按解析后的目录和标识分组，共用一个队列、一个写入 worker 和一个当前 `.ndjson.part`。任一路由的流量都会占用共享队列容量，可用 `request.url` 区分各条记录的来源。这些路由的 `queue_size` 和所有 `roll_*` 设置必须一致，热重载时同时存在的新旧配置也适用。修改正在运行的组的这些设置需要重启。捕获模式和 body 上限按路由配置。同组路由嵌套时，同一请求只在最外层捕获一次。
+在同一个 Caddy 进程中，解析后的输出目录和 `identity` 相同的 tap 定义共用一个队列、一个写入 worker 和一个当前 `.ndjson.part`。任一路由的流量都会占用共享队列容量，可用 `request.url` 区分记录来源。
+
+- **`queue_size` 或任意 `roll_*` 设置不同。** Caddy 拒绝加载配置。如果热重载失败，旧配置会继续运行。修改正在运行的组的这些设置需要重启 Caddy。
+- **`mode` 或 `max_body_bytes` 不同。** 各路由使用自己的采集设置，仍共用写入 worker。如果同一个 HTTP 请求进入同组的多个 tap handler，只由最外层实际开始采集的 handler 按自己的设置记录一次。
+- **解析后的输出目录不同。** 即使 `identity` 相同，各目录也有独立的队列、写入 worker 和文件。
 
 写入中的文件形如 `api-20261111T120000-123456789.ndjson.part`，权限为 `0600`。按大小或时间滚动，以及优雅关闭时，先同步并关闭文件，再在同一目录内将其改名为 `api-20261111T120000-123456789.ndjson`。封存失败时保留 part，等待恢复。
 

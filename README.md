@@ -18,12 +18,11 @@ xcaddy build v2.11.9 --with "caddy-tap=$(pwd)" --output /tmp/caddy-tap
 
 ## Caddyfile
 
-This configuration captures only `/api/*`. Remove `@api` to enable capture for the whole site. You can also use tap inside a `handle` block or place it before a response handler such as `reverse_proxy` inside a `route` block, which runs handlers in the order written.
+We recommend defining each shared tap configuration once in a [Caddyfile snippet](https://caddyserver.com/docs/caddyfile/directives/import) and importing it wherever needed. This example captures `/api/*` and `/webhooks/*` using the same settings. Each import passes only the request matcher.
 
 ```caddyfile
-:8080 {
-    @api path /api/*
-    tap @api {
+(capture_api) {
+    tap {args[0]} {
         identity api
         directory /var/log/caddy/tap
         mode drop
@@ -34,6 +33,13 @@ This configuration captures only `/api/*`. Remove `@api` to enable capture for t
         roll_keep 10
         roll_keep_for 720h
     }
+}
+
+:8080 {
+    @api path /api/*
+    @webhooks path /webhooks/*
+    import capture_api @api
+    import capture_api @webhooks
 
     reverse_proxy localhost:9000
 }
@@ -88,7 +94,11 @@ Place this object in the HTTP route's `handle` array before the handler you want
 
 ### Log files and uploads
 
-To write records from separate routes such as `/api/*` and `/webhooks/*` to one file, set the same `directory` and `identity` in both tap blocks. Within one Caddy process, the resolved directory and identity select a shared queue, writer and current `.ndjson.part`. Traffic on either route consumes capacity from that queue. Use `request.url` to tell the records apart. They must agree on `queue_size` and all `roll_*` settings, including while old and new configurations overlap during a reload. Changing these settings for a live group requires a restart. Capture mode and body limits are set per route. Nested routes in the same group capture the request once at the outermost invocation.
+Within one Caddy process, tap definitions with the same resolved output directory and `identity` share one queue, writer, and current `.ndjson.part`. Traffic on either route consumes capacity from that queue. Use `request.url` to tell the records apart.
+
+- **Different `queue_size` or `roll_*` settings.** Caddy rejects the configuration. On a failed reload, the previous configuration keeps running. Restart Caddy to change these settings for a live group.
+- **Different `mode` or `max_body_bytes`.** Each route uses its own capture settings and shares the same writer. If the same HTTP request enters multiple tap handlers in that group, only the outermost handler that starts capture records it, using its own settings.
+- **Different resolved output directories.** Each directory has its own queue, writer, and files, even with the same `identity`.
 
 The writer creates files such as `api-20261111T120000-123456789.ndjson.part` with permissions `0600`. After a size or time rotation or graceful shutdown, it syncs and closes the file before renaming it in the same directory to `api-20261111T120000-123456789.ndjson`. Failed finalization leaves the part for recovery.
 
